@@ -72,7 +72,7 @@ def convert_mmcif_to_pdb(mmcif_str, query_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run ESMFold2 and optionally estimate interaction affinity.")
+    parser = argparse.ArgumentParser(description="Run ESMFold2 and output a structure and CSV metrics.")
     parser.add_argument("-i", "--inputfile", required=True, 
                         help="Input FASTA file containing one or more protein sequences")
     parser.add_argument("--tag", default="esf2", 
@@ -83,8 +83,8 @@ def main():
                         help="Print detailed processing information to STDERR")
     parser.add_argument("--refresh", action="store_true", 
                         help="Force recalculation even if the output file already exists")
-    parser.add_argument("--affinity", action="store_true", 
-                        help="Calculate an affinity proxy (ipTM) for the predicted complex")
+    parser.add_argument("--budget", type=float, default=None,
+                        help="Compute budget in hours (heuristically scales diffusion samples)")
 
     args = parser.parse_args()
 
@@ -106,13 +106,13 @@ def main():
 
     basename = os.path.splitext(os.path.basename(in_path))[0]
     out_pdb = os.path.join(out_dir, f"{basename}.{args.tag}.pdb")
-    out_meta = os.path.join(out_dir, f"{basename}.{args.tag}.stat.csv")
+    out_csv = os.path.join(out_dir, f"{basename}.{args.tag}.csv")
 
-    # 2. Check Refresh
+    # 2. Check Refresh using the CSV as the primary target
     if not args.refresh:
-        if os.path.exists(out_pdb) and os.path.getsize(out_pdb) > 0:
-            vprint(f"Output file {out_pdb} already exists. Skipping computation.")
-            print(out_pdb)
+        if os.path.exists(out_csv) and os.path.getsize(out_csv) > 0:
+            vprint(f"Output file {out_csv} already exists. Skipping computation.")
+            print(out_csv)
             sys.exit(0)
 
     # 3. Parse FASTA
@@ -140,7 +140,15 @@ def main():
         eprint("Error: No sequences found in the input FASTA.")
         sys.exit(1)
 
-    # 4. Load Model
+    # 4. Process Budget Flag
+    num_diff_samples = 1
+    if args.budget:
+        # Heuristic mapping: assume ~1 minute per structure fold. 
+        # H hours * 60 = X diffusion samples.
+        num_diff_samples = max(1, int(args.budget * 60))
+        vprint(f"Budget of {args.budget} hours provided. Scaling to {num_diff_samples} diffusion sample(s).")
+
+    # 5. Load Model
     vprint("Loading ESM modules and biohub/ESMFold2 on GPU...")
     try:
         from esm.models.esmfold2 import ProteinInput, StructurePredictionInput, ESMFold2InputBuilder
@@ -151,30 +159,53 @@ def main():
 
     model = ESMFold2Model.from_pretrained("biohub/ESMFold2").cuda().eval()
 
-    # 5. Predict
+    # 6. Predict (Modified for Sequential Sampling to save VRAM)
     vprint(f"Folding {len(sequences)} sequence(s)...")
     protein_inputs = [ProteinInput(id=sid, sequence=seq) for sid, seq in sequences]
     spi = StructurePredictionInput(sequences=protein_inputs)
 
-    result = ESMFold2InputBuilder().fold(
-        model, spi, num_loops=20, num_sampling_steps=100, num_diffusion_samples=1, seed=0
-    )
+    results = []
+    for i in range(num_diff_samples):
+        vprint(f"Generating diffusion sample {i+1}/{num_diff_samples}...")
+        # Pass num_diffusion_samples=1 but vary the seed per iteration
+        sample_result = ESMFold2InputBuilder().fold(
+            model, 
+            spi, 
+            num_loops=20, 
+            num_sampling_steps=100, 
+            num_diffusion_samples=1, 
+            seed=i
+        )
+        results.append(sample_result)
 
-    # 6. Extract Metrics
-    plddt = float(result.plddt.mean())
-    ptm = float(result.ptm)
-    iptm = float(result.iptm)
+    # Select the best model by pTM out of the sequentially collected list
+    vprint(f"Selecting the best model out of {len(results)} sequential samples by pTM...")
+    result = max(results, key=lambda r: float(r.ptm) if r.ptm is not None else -1.0)
+
+#    # 6. Predict
+#    vprint(f"Folding {len(sequences)} sequence(s)...")
+#    protein_inputs = [ProteinInput(id=sid, sequence=seq) for sid, seq in sequences]
+#    spi = StructurePredictionInput(sequences=protein_inputs)
+#
+#    # fold() returns a list if num_diffusion_samples > 1
+#    results = ESMFold2InputBuilder().fold(
+#        model, spi, num_loops=20, num_sampling_steps=100, num_diffusion_samples=num_diff_samples, seed=0
+#    )
+
+    if isinstance(results, list):
+        vprint(f"Generated {len(results)} samples. Selecting the best model by pTM...")
+        result = max(results, key=lambda r: float(r.ptm) if r.ptm is not None else -1.0)
+    else:
+        result = results
+
+    # 7. Extract Metrics
+    plddt = float(result.plddt.mean()) if result.plddt is not None else 0.0
+    ptm = float(result.ptm) if result.ptm is not None else 0.0
+    iptm = float(result.iptm) if result.iptm is not None else 0.0
     
-    vprint(f"Metrics -> pLDDT: {plddt:.3f}, pTM: {ptm:.3f}, ipTM: {iptm:.3f}")
+    vprint(f"Final Best Metrics -> pLDDT: {plddt:.3f}, pTM: {ptm:.3f}, ipTM: {iptm:.3f}")
 
-    if args.affinity:
-        if len(sequences) < 2:
-            vprint("WARNING: --affinity flag used, but only one sequence provided. Affinity proxy (ipTM) requires a complex.")
-        else:
-            vprint(f">>> Affinity Proxy (ipTM) for complex: {iptm:.3f} <<<")
-            vprint("(Note: ipTM measures interface confidence, not true thermodynamic binding affinity)")
-
-    # 7. Write Outputs
+    # 8. Write Outputs
     try:
         raw_mmcif_str = result.complex.to_mmcif()
         standard_pdb_str = convert_mmcif_to_pdb(raw_mmcif_str, query_name=basename)
@@ -182,18 +213,17 @@ def main():
         with open(out_pdb, "w") as f:
             f.write(standard_pdb_str)
 
-        with open(out_meta, "w") as f:
-            f.write(f"basename,pLDDT,pTM,ipTM\n")
+        # Write clean CSV
+        with open(out_csv, "w") as f:
+            f.write("query_name,pLDDT,pTM,ipTM\n")
             f.write(f"{basename},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
-            if args.affinity:
-                f.write(f"Affinity_Proxy_ipTM: {iptm:.3f}\n")
 
     except Exception as e:
         eprint(f"Error writing files: {e}")
         sys.exit(1)
 
-    # 8. Output strictly to STDOUT
-    print(out_pdb)
+    # 9. Output strictly to STDOUT
+    print(out_csv)
 
 if __name__ == "__main__":
     main()
