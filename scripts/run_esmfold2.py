@@ -106,7 +106,7 @@ def main():
 
     basename = os.path.splitext(os.path.basename(in_path))[0]
     out_pdb = os.path.join(out_dir, f"{basename}.{args.tag}.pdb")
-    out_meta = os.path.join(out_dir, f"{basename}.{args.tag}.meta.txt")
+    out_meta = os.path.join(out_dir, f"{basename}.{args.tag}.stat.csv")
 
     # 2. Check Refresh
     if not args.refresh:
@@ -183,9 +183,8 @@ def main():
             f.write(standard_pdb_str)
 
         with open(out_meta, "w") as f:
-            f.write(f"pLDDT: {plddt:.3f}\n")
-            f.write(f"pTM: {ptm:.3f}\n")
-            f.write(f"ipTM: {iptm:.3f}\n")
+            f.write(f"basename,pLDDT,pTM,ipTM\n")
+            f.write(f"{basename},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
             if args.affinity:
                 f.write(f"Affinity_Proxy_ipTM: {iptm:.3f}\n")
 
