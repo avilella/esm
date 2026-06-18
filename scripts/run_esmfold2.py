@@ -85,6 +85,10 @@ def main():
                         help="Force recalculation even if the output file already exists")
     parser.add_argument("--budget", type=float, default=None,
                         help="Compute budget in hours (heuristically scales diffusion samples)")
+    parser.add_argument("--activation-checkpointing", action="store_true",
+                        help="Enable activation checkpointing on the model transformer blocks to reduce peak VRAM usage")
+    parser.add_argument("--msa_max_depth", type=int, default=1024,
+                        help="Maximum number of MSA sequences to randomly subsample each loop to prevent memory explosion (default: 1024)")
 
     args = parser.parse_args()
 
@@ -153,11 +157,26 @@ def main():
     try:
         from esm.models.esmfold2 import ProteinInput, StructurePredictionInput, ESMFold2InputBuilder
         from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            apply_activation_checkpointing,
+            checkpoint_wrapper,
+        )
+        from transformers.models.esmc.modeling_esmc import UnifiedTransformerBlock as TransformerBlock
     except ImportError as e:
         eprint(f"Error importing ESM modules: {e}")
         sys.exit(1)
 
     model = ESMFold2Model.from_pretrained("biohub/ESMFold2").cuda().eval()
+
+    # Apply activation checkpointing to the language model blocks if explicitly requested
+    if args.activation_checkpointing:
+        vprint("Applying activation checkpointing to TransformerBlock layers to optimize memory...")
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=lambda m: checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
+            check_fn=lambda module: isinstance(module, TransformerBlock),
+        )
 
     # 6. Predict (Modified for Sequential Sampling to save VRAM)
     vprint(f"Folding {len(sequences)} sequence(s)...")
@@ -174,23 +193,14 @@ def main():
             num_loops=20, 
             num_sampling_steps=100, 
             num_diffusion_samples=1, 
-            seed=i
+            seed=i,
+            msa_max_depth=args.msa_max_depth
         )
         results.append(sample_result)
 
     # Select the best model by pTM out of the sequentially collected list
     vprint(f"Selecting the best model out of {len(results)} sequential samples by pTM...")
     result = max(results, key=lambda r: float(r.ptm) if r.ptm is not None else -1.0)
-
-#    # 6. Predict
-#    vprint(f"Folding {len(sequences)} sequence(s)...")
-#    protein_inputs = [ProteinInput(id=sid, sequence=seq) for sid, seq in sequences]
-#    spi = StructurePredictionInput(sequences=protein_inputs)
-#
-#    # fold() returns a list if num_diffusion_samples > 1
-#    results = ESMFold2InputBuilder().fold(
-#        model, spi, num_loops=20, num_sampling_steps=100, num_diffusion_samples=num_diff_samples, seed=0
-#    )
 
     if isinstance(results, list):
         vprint(f"Generated {len(results)} samples. Selecting the best model by pTM...")
