@@ -89,6 +89,12 @@ def main():
                         help="Enable activation checkpointing on the model transformer blocks to reduce peak VRAM usage")
     parser.add_argument("--msa_max_depth", type=int, default=1024,
                         help="Maximum number of MSA sequences to randomly subsample each loop to prevent memory explosion (default: 1024)")
+    parser.add_argument("--num_loops", type=int, default=3,
+                        help="Number of trunk loops for iterative refinement (default: 3, optimized for binder design)")
+    parser.add_argument("--num_sampling_steps", type=int, default=200,
+                        help="Diffusion ODE solver steps (default: 200, optimized for structure quality)")
+    parser.add_argument("--lm_dropout", type=float, default=0.25,
+                        help="Dropout probability on LM embeddings to increase ensemble diversity (default: 0.25)")
 
     args = parser.parse_args()
 
@@ -178,7 +184,7 @@ def main():
             check_fn=lambda module: isinstance(module, TransformerBlock),
         )
 
-    # 6. Predict (Modified for Sequential Sampling to save VRAM)
+    # 6. Predict (Sequential Sampling to save VRAM)
     vprint(f"Folding {len(sequences)} sequence(s)...")
     protein_inputs = [ProteinInput(id=sid, sequence=seq) for sid, seq in sequences]
     spi = StructurePredictionInput(sequences=protein_inputs)
@@ -186,15 +192,16 @@ def main():
     results = []
     for i in range(num_diff_samples):
         vprint(f"Generating diffusion sample {i+1}/{num_diff_samples}...")
-        # Pass num_diffusion_samples=1 but vary the seed per iteration
+        # Pass num_diffusion_samples=1 but vary the seed per iteration for diversity
         sample_result = ESMFold2InputBuilder().fold(
             model, 
             spi, 
-            num_loops=20, 
-            num_sampling_steps=100, 
+            num_loops=args.num_loops, 
+            num_sampling_steps=args.num_sampling_steps, 
             num_diffusion_samples=1, 
             seed=i,
-            msa_max_depth=args.msa_max_depth
+            msa_max_depth=args.msa_max_depth,
+            lm_dropout=args.lm_dropout
         )
         results.append(sample_result)
 
@@ -213,7 +220,7 @@ def main():
     ptm = float(result.ptm) if result.ptm is not None else 0.0
     iptm = float(result.iptm) if result.iptm is not None else 0.0
     
-    vprint(f"Final Best Metrics -> pLDDT: {plddt:.3f}, pTM: {ptm:.3f}, ipTM: {iptm:.3f}")
+    vprint(f"Final Best Metrics -> pLDDT: {plddt:.6f}, pTM: {ptm:.6f}, ipTM: {iptm:.6f}")
 
     # 8. Write Outputs
     try:
@@ -226,7 +233,7 @@ def main():
         # Write clean CSV
         with open(out_csv, "w") as f:
             f.write("query_name,pLDDT,pTM,ipTM\n")
-            f.write(f"{basename},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
+            f.write(f"{basename},{plddt:.6f},{ptm:.6f},{iptm:.6f}\n")
 
     except Exception as e:
         eprint(f"Error writing files: {e}")
