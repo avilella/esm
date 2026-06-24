@@ -3,6 +3,8 @@ import argparse
 import sys
 import os
 import datetime
+import json
+import tempfile
 
 def convert_mmcif_to_pdb(mmcif_str, query_name):
     """
@@ -73,8 +75,10 @@ def convert_mmcif_to_pdb(mmcif_str, query_name):
 
 def main():
     parser = argparse.ArgumentParser(description="Run ESMFold2 and output a structure and CSV metrics.")
-    parser.add_argument("-i", "--inputfile", required=True, 
+    parser.add_argument("-i", "--inputfile", default=None, 
                         help="Input FASTA file containing one or more protein sequences")
+    parser.add_argument("--json", default=None, 
+                        help="JSON payload with heavy, light, and antigen sequences to evaluate directly")
     parser.add_argument("--tag", default="esf2", 
                         help="Tag for output files (default: esf2)")
     parser.add_argument("--outdir", default=None, 
@@ -89,12 +93,6 @@ def main():
                         help="Enable activation checkpointing on the model transformer blocks to reduce peak VRAM usage")
     parser.add_argument("--msa_max_depth", type=int, default=1024,
                         help="Maximum number of MSA sequences to randomly subsample each loop to prevent memory explosion (default: 1024)")
-    parser.add_argument("--num_loops", type=int, default=3,
-                        help="Number of trunk loops for iterative refinement (default: 3, optimized for binder design)")
-    parser.add_argument("--num_sampling_steps", type=int, default=200,
-                        help="Diffusion ODE solver steps (default: 200, optimized for structure quality)")
-    parser.add_argument("--lm_dropout", type=float, default=0.25,
-                        help="Dropout probability on LM embeddings to increase ensemble diversity (default: 0.25)")
 
     args = parser.parse_args()
 
@@ -105,25 +103,57 @@ def main():
     def eprint(*pargs, **kwargs):
         print(*pargs, file=sys.stderr, **kwargs)
 
-    # 1. Resolve Paths
-    in_path = os.path.abspath(args.inputfile)
-    
-    if args.outdir is not None:
-        out_dir = os.path.abspath(args.outdir)
-        os.makedirs(out_dir, exist_ok=True)
+    if not args.inputfile and not args.json:
+        eprint("Error: Must provide either -i/--inputfile or --json.")
+        sys.exit(1)
+
+    is_json_mode = False
+    temp_fasta_path = None
+    basename = "complex"
+
+    # 1. Resolve Paths & Input Mode
+    if args.json:
+        is_json_mode = True
+        try:
+            payload = json.loads(args.json)
+        except json.JSONDecodeError as e:
+            eprint(f"Error parsing JSON payload: {e}")
+            sys.exit(1)
+        
+        heavy = payload.get("heavy", "")
+        light = payload.get("light", "")
+        antigen = payload.get("antigen", "")
+        basename = payload.get("name", "json_query")
+        
+        linker = "GGGSGGGSGGGSGGGS"
+        mab_seq = heavy + linker + light
+        
+        # Create temporary FASTA
+        fd, temp_fasta_path = tempfile.mkstemp(suffix=".fasta", text=True)
+        with os.fdopen(fd, 'w') as f:
+            f.write(f">mAb\n{mab_seq}\n")
+            f.write(f">antigen\n{antigen}\n")
+        
+        in_path = temp_fasta_path
     else:
-        out_dir = os.path.dirname(in_path)
+        in_path = os.path.abspath(args.inputfile)
+        basename = os.path.splitext(os.path.basename(in_path))[0]
+        
+        if args.outdir is not None:
+            out_dir = os.path.abspath(args.outdir)
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            out_dir = os.path.dirname(in_path)
 
-    basename = os.path.splitext(os.path.basename(in_path))[0]
-    out_pdb = os.path.join(out_dir, f"{basename}.{args.tag}.pdb")
-    out_csv = os.path.join(out_dir, f"{basename}.{args.tag}.csv")
+        out_pdb = os.path.join(out_dir, f"{basename}.{args.tag}.pdb")
+        out_csv = os.path.join(out_dir, f"{basename}.{args.tag}.csv")
 
-    # 2. Check Refresh using the CSV as the primary target
-    if not args.refresh:
-        if os.path.exists(out_csv) and os.path.getsize(out_csv) > 0:
-            vprint(f"Output file {out_csv} already exists. Skipping computation.")
-            print(out_csv)
-            sys.exit(0)
+        # 2. Check Refresh using the CSV as the primary target (File Mode Only)
+        if not args.refresh:
+            if os.path.exists(out_csv) and os.path.getsize(out_csv) > 0:
+                vprint(f"Output file {out_csv} already exists. Skipping computation.")
+                print(out_csv)
+                sys.exit(0)
 
     # 3. Parse FASTA
     if not os.path.exists(in_path):
@@ -171,76 +201,79 @@ def main():
         from transformers.models.esmc.modeling_esmc import UnifiedTransformerBlock as TransformerBlock
     except ImportError as e:
         eprint(f"Error importing ESM modules: {e}")
+        if is_json_mode and temp_fasta_path and os.path.exists(temp_fasta_path):
+            os.remove(temp_fasta_path)
         sys.exit(1)
 
-    model = ESMFold2Model.from_pretrained("biohub/ESMFold2").cuda().eval()
-
-    # Apply activation checkpointing to the language model blocks if explicitly requested
-    if args.activation_checkpointing:
-        vprint("Applying activation checkpointing to TransformerBlock layers to optimize memory...")
-        apply_activation_checkpointing(
-            model,
-            checkpoint_wrapper_fn=lambda m: checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
-            check_fn=lambda module: isinstance(module, TransformerBlock),
-        )
-
-    # 6. Predict (Sequential Sampling to save VRAM)
-    vprint(f"Folding {len(sequences)} sequence(s)...")
-    protein_inputs = [ProteinInput(id=sid, sequence=seq) for sid, seq in sequences]
-    spi = StructurePredictionInput(sequences=protein_inputs)
-
-    results = []
-    for i in range(num_diff_samples):
-        vprint(f"Generating diffusion sample {i+1}/{num_diff_samples}...")
-        # Pass num_diffusion_samples=1 but vary the seed per iteration for diversity
-        sample_result = ESMFold2InputBuilder().fold(
-            model, 
-            spi, 
-            num_loops=args.num_loops, 
-            num_sampling_steps=args.num_sampling_steps, 
-            num_diffusion_samples=1, 
-            seed=i,
-            msa_max_depth=args.msa_max_depth,
-            lm_dropout=args.lm_dropout
-        )
-        results.append(sample_result)
-
-    # Select the best model by pTM out of the sequentially collected list
-    vprint(f"Selecting the best model out of {len(results)} sequential samples by pTM...")
-    result = max(results, key=lambda r: float(r.ptm) if r.ptm is not None else -1.0)
-
-    if isinstance(results, list):
-        vprint(f"Generated {len(results)} samples. Selecting the best model by pTM...")
-        result = max(results, key=lambda r: float(r.ptm) if r.ptm is not None else -1.0)
-    else:
-        result = results
-
-    # 7. Extract Metrics
-    plddt = float(result.plddt.mean()) if result.plddt is not None else 0.0
-    ptm = float(result.ptm) if result.ptm is not None else 0.0
-    iptm = float(result.iptm) if result.iptm is not None else 0.0
-    
-    vprint(f"Final Best Metrics -> pLDDT: {plddt:.6f}, pTM: {ptm:.6f}, ipTM: {iptm:.6f}")
-
-    # 8. Write Outputs
     try:
+        model = ESMFold2Model.from_pretrained("biohub/ESMFold2").cuda().eval()
+
+        # Apply activation checkpointing to the language model blocks if explicitly requested
+        if args.activation_checkpointing:
+            vprint("Applying activation checkpointing to TransformerBlock layers to optimize memory...")
+            apply_activation_checkpointing(
+                model,
+                checkpoint_wrapper_fn=lambda m: checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
+                check_fn=lambda module: isinstance(module, TransformerBlock),
+            )
+
+        # 6. Predict (Modified for Sequential Sampling to save VRAM)
+        vprint(f"Folding {len(sequences)} sequence(s)...")
+        protein_inputs = [ProteinInput(id=sid, sequence=seq) for sid, seq in sequences]
+        spi = StructurePredictionInput(sequences=protein_inputs)
+
+        results = []
+        for i in range(num_diff_samples):
+            vprint(f"Generating diffusion sample {i+1}/{num_diff_samples}...")
+            # Pass num_diffusion_samples=1 but vary the seed per iteration
+            sample_result = ESMFold2InputBuilder().fold(
+                model, 
+                spi, 
+                num_loops=20, 
+                num_sampling_steps=100, 
+                num_diffusion_samples=1, 
+                seed=i,
+                msa_max_depth=args.msa_max_depth
+            )
+            results.append(sample_result)
+
+        # Select the best model by pTM out of the sequentially collected list
+        vprint(f"Selecting the best model out of {len(results)} sequential samples by pTM...")
+        result = max(results, key=lambda r: float(r.ptm) if r.ptm is not None else -1.0)
+
+        # 7. Extract Metrics
+        plddt = float(result.plddt.mean()) if result.plddt is not None else 0.0
+        ptm = float(result.ptm) if result.ptm is not None else 0.0
+        iptm = float(result.iptm) if result.iptm is not None else 0.0
+        
+        vprint(f"Final Best Metrics -> pLDDT: {plddt:.3f}, pTM: {ptm:.3f}, ipTM: {iptm:.3f}")
+
+        # 8. Write Outputs
         raw_mmcif_str = result.complex.to_mmcif()
         standard_pdb_str = convert_mmcif_to_pdb(raw_mmcif_str, query_name=basename)
         
-        with open(out_pdb, "w") as f:
-            f.write(standard_pdb_str)
+        if is_json_mode:
+            # Output strictly to STDOUT and skip file writing
+            print(standard_pdb_str)
+        else:
+            with open(out_pdb, "w") as f:
+                f.write(standard_pdb_str)
 
-        # Write clean CSV
-        with open(out_csv, "w") as f:
-            f.write("query_name,pLDDT,pTM,ipTM\n")
-            f.write(f"{basename},{plddt:.6f},{ptm:.6f},{iptm:.6f}\n")
+            # Write clean CSV
+            with open(out_csv, "w") as f:
+                f.write("query_name,pLDDT,pTM,ipTM\n")
+                f.write(f"{basename},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
+
+            # 9. Output strictly to STDOUT
+            print(out_csv)
 
     except Exception as e:
-        eprint(f"Error writing files: {e}")
+        eprint(f"Error during processing or writing: {e}")
         sys.exit(1)
-
-    # 9. Output strictly to STDOUT
-    print(out_csv)
+    finally:
+        # Clean up temporary files 
+        if is_json_mode and temp_fasta_path and os.path.exists(temp_fasta_path):
+            os.remove(temp_fasta_path)
 
 if __name__ == "__main__":
     main()
