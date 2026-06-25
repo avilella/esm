@@ -90,8 +90,8 @@ def main():
                         help="Print detailed processing information to STDERR")
     parser.add_argument("--refresh", action="store_true", 
                         help="Force recalculation even if the output file already exists")
-    parser.add_argument("--budget", type=float, default=None,
-                        help="Compute budget in hours (heuristically scales diffusion samples)")
+    parser.add_argument("--budget-min", type=float, default=None,
+                        help="Compute budget in minutes (heuristically scales diffusion samples)")
     parser.add_argument("--activation-checkpointing", action="store_true",
                         help="Enable activation checkpointing on the model transformer blocks to reduce peak VRAM usage")
     parser.add_argument("--msa_max_depth", type=int, default=1024,
@@ -185,11 +185,10 @@ def main():
 
     # 4. Process Budget Flag
     num_diff_samples = 1
-    if args.budget:
+    if args.budget_min:
         # Heuristic mapping: assume ~1 minute per structure fold. 
-        # H hours * 60 = X diffusion samples.
-        num_diff_samples = max(1, int(args.budget * 60))
-        vprint(f"Budget of {args.budget} hours provided. Scaling to {num_diff_samples} diffusion sample(s).")
+        num_diff_samples = max(1, int(args.budget_min))
+        vprint(f"Budget of {args.budget_min} minutes provided. Scaling to {num_diff_samples} diffusion sample(s).")
 
     # 5. Load Model
     vprint("Loading ESM modules and biohub/ESMFold2 on GPU...")
