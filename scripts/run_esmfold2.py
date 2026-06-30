@@ -324,8 +324,8 @@ def main():
 
             # Write clean CSV
             with open(out_csv, "w") as f:
-                f.write("query_name,pLDDT,pTM,ipTM\n")
-                f.write(f"{basename},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
+                f.write("query_name,tag,pLDDT,pTM,ipTM\n")
+                f.write(f"{basename},{args.tag},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
 
             # 9. Output strictly to True STDOUT
             print(out_csv, file=original_stdout)
