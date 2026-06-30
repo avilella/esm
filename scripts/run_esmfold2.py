@@ -6,6 +6,7 @@ import datetime
 import json
 import tempfile
 import time
+import numpy as np
 
 # Suppress HuggingFace transformers verbosity at the environment level
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -115,10 +116,14 @@ def main():
                         help="Force recalculation even if the output file already exists")
     parser.add_argument("--budget-min", type=float, default=None,
                         help="Compute budget in minutes (enforces a wall-clock limit on diffusion sampling loops)")
+    parser.add_argument("--ensemble", type=int, default=1,
+                        help="Produce a full ensemble of N predictions instead of one")
     parser.add_argument("--activation-checkpointing", action="store_true",
                         help="Enable activation checkpointing on the model transformer blocks to reduce peak VRAM usage")
     parser.add_argument("--msa_max_depth", type=int, default=1024,
                         help="Maximum number of MSA sequences to randomly subsample each loop to prevent memory explosion (default: 1024)")
+    parser.add_argument("--detailed-output", action="store_true",
+                        help="Produce detailed per-residue/atom scores and matrices (PAE, distogram) in output files or JSON")
 
     args = parser.parse_args()
 
@@ -171,7 +176,6 @@ def main():
         else:
             out_dir = os.path.dirname(in_path)
 
-        out_pdb = os.path.join(out_dir, f"{basename}.{args.tag}.pdb")
         out_csv = os.path.join(out_dir, f"{basename}.{args.tag}.csv")
 
         # 2. Check Refresh using the CSV as the primary target (File Mode Only)
@@ -209,19 +213,20 @@ def main():
 
     # 4. Process Budget Flag & Initialize Run Parameters
     budget_seconds = None
-    max_iterations = 1
     if args.budget_min:
         budget_seconds = float(args.budget_min) * 60.0
         max_iterations = 999999  # Effectively infinite; breaks on time limit
         vprint(f"Time budget set to {args.budget_min} minutes. Will run sequential samples until budget is exhausted.")
     else:
-        vprint("No budget provided. Defaulting to a single diffusion sample.")
+        max_iterations = args.ensemble
+        vprint(f"No budget provided. Defaulting to {max_iterations} diffusion sample(s).")
         
     num_loops = 20
     num_sampling_steps = 100
     
     run_params = {
         "BUDGET_MIN": args.budget_min if args.budget_min is not None else "None",
+        "ENSEMBLE_SIZE": args.ensemble,
         "NUM_LOOPS": num_loops,
         "NUM_SAMPLING_STEPS": num_sampling_steps,
         "MSA_MAX_DEPTH": args.msa_max_depth,
@@ -289,45 +294,103 @@ def main():
         # Log actual number of samples completed
         run_params["ACTUAL_DIFFUSION_SAMPLES"] = len(results)
 
-        # Select the best model by pTM out of the sequentially collected list
-        vprint(f"Selecting the best model out of {len(results)} sequential samples by pTM...")
-        result = max(results, key=lambda r: float(r.ptm) if r.ptm is not None else -1.0)
+        # Select the top N models by pTM
+        vprint(f"Selecting the top {args.ensemble} model(s) out of {len(results)} sequential samples by pTM...")
+        results.sort(key=lambda r: float(r.ptm) if r.ptm is not None else -1.0, reverse=True)
+        top_results = results[:args.ensemble]
 
-        # 7. Extract Metrics
-        plddt = float(result.plddt.mean()) if result.plddt is not None else 0.0
-        ptm = float(result.ptm) if result.ptm is not None else 0.0
-        iptm = float(result.iptm) if result.iptm is not None else 0.0
+        # 7 & 8. Extract Metrics, Generate Output Files
+        json_payloads = []
+        csv_lines = ["query_name,tag,rank,pLDDT,pTM,ipTM\n"]
         
-        metrics = {
-            "pLDDT": plddt,
-            "pTM": ptm,
-            "ipTM": iptm
-        }
-        
-        vprint(f"Final Best Metrics -> pLDDT: {plddt:.3f}, pTM: {ptm:.3f}, ipTM: {iptm:.3f}")
+        for rank, result in enumerate(top_results, start=1):
+            plddt = float(result.plddt.mean()) if result.plddt is not None else 0.0
+            ptm = float(result.ptm) if result.ptm is not None else 0.0
+            iptm = float(result.iptm) if result.iptm is not None else 0.0
+            
+            metrics = {
+                "pLDDT": plddt,
+                "pTM": ptm,
+                "ipTM": iptm
+            }
+            
+            vprint(f"Rank {rank} Metrics -> pLDDT: {plddt:.3f}, pTM: {ptm:.3f}, ipTM: {iptm:.3f}")
 
-        # 8. Write Outputs
-        raw_mmcif_str = result.complex.to_mmcif()
-        standard_pdb_str = convert_mmcif_to_pdb(
-            raw_mmcif_str, 
-            query_name=basename, 
-            metrics=metrics, 
-            params=run_params
-        )
-        
+            # Extract Detailed Data (if requested)
+            detailed_data = None
+            if args.detailed_output:
+                vprint(f"Compiling detailed output metrics for Rank {rank}...")
+                detailed_data = {
+                    "sequence": np.array(result.complex.sequence),
+                    "chain_id": result.complex.chain_id,
+                    "plddt": result.plddt.cpu().numpy() if result.plddt is not None else np.zeros(len(result.complex.sequence)),
+                    "ptm": np.array(ptm),
+                    "iptm": np.array(iptm),
+                    "atom_positions": result.complex.atom_positions,
+                    "atom_elements": result.complex.atom_elements,
+                    "token_to_atoms": result.complex.token_to_atoms
+                }
+                if result.pae is not None:
+                    detailed_data["pae"] = result.pae.cpu().numpy()
+                if result.distogram is not None:
+                    detailed_data["distogram"] = result.distogram.cpu().numpy()
+                if result.pair_chains_iptm is not None:
+                    detailed_data["pair_chains_iptm"] = result.pair_chains_iptm.cpu().numpy()
+
+            query_name_display = f"{basename}_rank{rank}" if args.ensemble > 1 else basename
+            raw_mmcif_str = result.complex.to_mmcif()
+            standard_pdb_str = convert_mmcif_to_pdb(
+                raw_mmcif_str, 
+                query_name=query_name_display, 
+                metrics=metrics, 
+                params=run_params
+            )
+            
+            if is_json_mode:
+                out_payload = {
+                    "rank": rank,
+                    "pdb": standard_pdb_str,
+                    "metrics": metrics
+                }
+                if args.detailed_output:
+                    json_detailed = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in detailed_data.items()}
+                    out_payload["detailed"] = json_detailed
+                
+                json_payloads.append(out_payload)
+            else:
+                # File mode
+                suffix = f"_rank{rank}" if args.ensemble > 1 else ""
+                
+                out_pdb = os.path.join(out_dir, f"{basename}.{args.tag}{suffix}.pdb")
+                with open(out_pdb, "w") as f:
+                    f.write(standard_pdb_str)
+                    
+                csv_lines.append(f"{basename},{args.tag},{rank},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
+                
+                if args.detailed_output:
+                    out_npz = os.path.join(out_dir, f"{basename}.{args.tag}{suffix}_detailed.npz")
+                    np.savez_compressed(out_npz, **detailed_data)
+                    
+                    out_detailed_csv = os.path.join(out_dir, f"{basename}.{args.tag}{suffix}_per_residue.csv")
+                    with open(out_detailed_csv, "w") as f:
+                        f.write("token_index,chain_id,residue_name,plddt,tag\n")
+                        seq = detailed_data["sequence"]
+                        cids = detailed_data["chain_id"]
+                        plddts = detailed_data["plddt"]
+                        for idx in range(len(seq)):
+                            f.write(f"{idx},{cids[idx]},{seq[idx]},{plddts[idx]:.4f},{args.tag}\n")
+                            
+                    vprint(f"Detailed outputs written to: \n  {out_npz}\n  {out_detailed_csv}")
+
+        # 9. Output final master payload or CSV
         if is_json_mode:
-            # Output strictly to True STDOUT and skip file writing
-            print(standard_pdb_str, file=original_stdout)
+            if args.ensemble == 1:
+                print(json.dumps(json_payloads[0]), file=original_stdout)
+            else:
+                print(json.dumps(json_payloads), file=original_stdout)
         else:
-            with open(out_pdb, "w") as f:
-                f.write(standard_pdb_str)
-
-            # Write clean CSV
             with open(out_csv, "w") as f:
-                f.write("query_name,tag,pLDDT,pTM,ipTM\n")
-                f.write(f"{basename},{args.tag},{plddt:.3f},{ptm:.3f},{iptm:.3f}\n")
-
-            # 9. Output strictly to True STDOUT
+                f.writelines(csv_lines)
             print(out_csv, file=original_stdout)
 
     except Exception as e:
@@ -337,6 +400,7 @@ def main():
         # Clean up temporary files 
         if is_json_mode and temp_fasta_path and os.path.exists(temp_fasta_path):
             os.remove(temp_fasta_path)
+
 
 if __name__ == "__main__":
     main()
