@@ -343,7 +343,7 @@ def main():
 
         # 7 & 8. Extract Metrics, Generate Output Files
         json_payloads = []
-        csv_lines = ["query_name,tag,rank,pLDDT,pTM,ipTM,ipLDDT\n"]
+        csv_lines = ["query_name,tag,rank,pLDDT,pTM,ipTM,ipLDDT,structure\n"]
         
         for rank, result in enumerate(top_results, start=1):
             plddt_arr = result.plddt.cpu().numpy() if result.plddt is not None else np.zeros(len(result.complex.sequence))
@@ -419,7 +419,7 @@ def main():
                 with open(out_pdb, "w") as f:
                     f.write(standard_pdb_str)
                     
-                csv_lines.append(f"{basename},{args.tag},{rank},{plddt:.3f},{ptm:.3f},{iptm:.3f},{iplddt:.3f}\n")
+                csv_lines.append(f"{basename},{args.tag},{rank},{plddt:.3f},{ptm:.3f},{iptm:.3f},{iplddt:.3f},{out_pdb}\n")
                 
                 if args.detailed_output:
                     out_npz = os.path.join(out_dir, f"{basename}.{args.tag}{suffix}_detailed.npz")
