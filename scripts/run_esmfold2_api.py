@@ -33,7 +33,7 @@ def parse_args():
         "-i", "--inputfile", required=True, help="Input FASTA file containing protein chains of the complex."
     )
     parser.add_argument(
-        "--tag", default="tool", help="Tag for the output file (default: tool)."
+        "--tag", default="bioh", help="Tag for the output file (default: tool)."
     )
     parser.add_argument(
         "--outdir",
