@@ -3,6 +3,7 @@ import argparse
 import csv
 import sys
 import hashlib
+import time
 from pathlib import Path
 
 # Import the ESM SDK as demonstrated in the esmfold2.py notebook
@@ -33,7 +34,7 @@ def parse_args():
         "-i", "--inputfile", required=True, help="Input FASTA file containing protein chains of the complex."
     )
     parser.add_argument(
-        "--tag", default="bioh", help="Tag for the output file (default: tool)."
+        "--tag", default="esmf", help="Tag for the output file (default: esmf)."
     )
     parser.add_argument(
         "--outdir",
@@ -72,6 +73,11 @@ def parse_args():
         type=int,
         default=100,
         help="Number of diffusion sampling steps (default: 100).",
+    )
+    parser.add_argument(
+        "--ignore-limit",
+        action="store_true",
+        help="Ignore the default API rate limits (20 calls/min, 100 calls/24h).",
     )
 
     return parser.parse_args()
@@ -166,7 +172,10 @@ def main():
     complex_id = input_path.stem
     chains_str = "+".join(sequences.keys())
     seqs_str = ":".join(sequences.values())
+    amino_acids_str = seqs_str.replace(":", "")
     records = []
+    
+    rate_limit_file = Path.home() / "biohub.api.txt"
 
     if args.verbose:
         eprint(f"\nFolding complex '{complex_id}' with {len(sequences)} chains...")
@@ -197,12 +206,67 @@ def main():
             eprint(f"  Sampling complex fold {i}/{args.num_ensemble} via Biohub API...")
             eprint(f"    Parameters: num_loops={current_num_loops}, num_sampling_steps={current_num_sampling_steps}")
 
+        # Cross-execution file-based throttling logic (20 calls/min, 100 calls/24h)
+        if not args.ignore_limit:
+            while True:
+                current_time = time.time()
+                timestamps = []
+                
+                # Read existing timestamps from the shared file
+                if rate_limit_file.exists():
+                    try:
+                        with open(rate_limit_file, "r") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    ts = float(line)
+                                    # Only retain timestamps from the last 24 hours (86400 seconds)
+                                    if current_time - ts < 86400.0:
+                                        timestamps.append(ts)
+                    except Exception as e:
+                        if args.verbose:
+                            eprint(f"    Warning: Error reading rate limit file: {e}")
+                
+                timestamps.sort()
+                recent_timestamps = [ts for ts in timestamps if current_time - ts < 60.0]
+                
+                sleep_time = 0.0
+                limit_reason = ""
+                
+                # Check 24-hour limit (100 calls)
+                if len(timestamps) >= 100:
+                    sleep_time = 86400.0 - (current_time - timestamps[0])
+                    limit_reason = "100 calls/24h"
+                    
+                # Check 1-minute limit (20 calls)
+                if len(recent_timestamps) >= 20:
+                    minute_sleep = 60.0 - (current_time - recent_timestamps[0])
+                    if minute_sleep > sleep_time:
+                        sleep_time = minute_sleep
+                        limit_reason = "20 calls/min"
+
+                if sleep_time > 0:
+                    if args.verbose:
+                        eprint(f"    API rate limit ({limit_reason}) reached. Sleeping for {sleep_time:.2f} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    # Limits not reached; record current call and overwrite file
+                    timestamps.append(current_time)
+                    try:
+                        with open(rate_limit_file, "w") as f:
+                            for ts in timestamps:
+                                f.write(f"{ts}\n")
+                    except Exception as e:
+                        if args.verbose:
+                            eprint(f"    Warning: Error writing to rate limit file: {e}")
+                    break
+
         try:
             # Call remote prediction service for all-atom complex structure
             fold_result = client.fold_all_atom(complex_input, config=config) #[cite: 3]
 
             # Check if the SDK returned an explicit ESMProteinError object
-            if isinstance(fold_result, ESMProteinError): #[cite: 3]
+            if type(fold_result).__name__ == "ESMProteinError":
                 error_msg = getattr(fold_result, "error_msg", str(fold_result))
                 raise Exception(f"API Error: {error_msg}")
 
@@ -227,7 +291,7 @@ def main():
 
             # Append as a single record
             records.append({
-                "Name": f"ESF2-{md5_hash}",
+                "Name": f"ESMF-{complex_id}-{md5_hash}",
                 "md5sum": md5_hash,
                 "structure": resolved_cif_path,
                 "ComplexID": complex_id,
@@ -236,6 +300,7 @@ def main():
                 "num_loops": str(current_num_loops),
                 "num_sampling_steps": str(current_num_sampling_steps),
                 "sequences": seqs_str,
+                "Amino Acids": amino_acids_str,
                 "iptm": iptm_val,
                 "ptm": ptm_val,
                 "mean_plddt": plddt_val,
@@ -256,7 +321,7 @@ def main():
     with open(out_file, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "Name", "md5sum", "structure", "ComplexID", "Chains", "Sample", 
-            "num_loops", "num_sampling_steps", "sequences", 
+            "num_loops", "num_sampling_steps", "sequences", "Amino Acids",
             "iptm", "ptm", "mean_plddt", "mean_pae"
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
