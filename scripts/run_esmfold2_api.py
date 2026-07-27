@@ -64,14 +64,12 @@ def parse_args():
         "--num-loops",
         type=int,
         default=10,
-        required=True,
         help="num-loops.",
     )
     parser.add_argument(
         "--num-sampling-steps",
         type=int,
         default=100,
-        required=True,
         help="num-sampling steps.",
     )
 
