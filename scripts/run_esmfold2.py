@@ -321,10 +321,10 @@ def main():
                         help="Input FASTA file containing one or more protein sequences")
     parser.add_argument("--json", default=None, 
                         help="JSON payload with heavy, light, and antigen sequences to evaluate directly")
-    parser.add_argument("--extra-sequences", default=None, metavar="SEQ1:SEQ2",
-                        help="Colon-separated extra protein sequence(s) to append to the input FASTA records before "
-                             "validating --distogram-conditioning. Records are named extra_sequence_1, "
-                             "extra_sequence_2, etc. Example: --extra-sequences MSEQUENCE:ANOTHERSEQ")
+    parser.add_argument("--extra-sequences", default=None, metavar="NAME1:SEQ1::NAME2:SEQ2",
+                        help="Double-colon-separated named extra protein sequence(s) to append to the input FASTA records "
+                             "before validating --distogram-conditioning. Each item must be NAME:SEQUENCE. "
+                             "Example: --extra-sequences nano1:QVQLVES::nano2:EVQLVES")
     parser.add_argument("--tag", default="esf2", 
                         help="Tag for output files (default: esf2)")
     parser.add_argument("--outdir", default=None, 
@@ -435,28 +435,42 @@ def main():
             sequences.append((seq_id, "".join(seq_data)))
 
     # 3a. Append command-line extra sequences before any downstream validation.
-    #     This is intentionally done before --distogram-conditioning is resolved so
-    #     extra_sequence_1, extra_sequence_2, ... count as normal chains when deciding
-    #     whether every chain has been conditioned.
+    #     Format: --extra-sequences NAME1:SEQ1::NAME2:SEQ2
+    #     These named records are added to `sequences` before --distogram-conditioning
+    #     is resolved, so they count as normal chains when deciding whether every chain
+    #     has been conditioned.
     if args.extra_sequences:
-        extra_parts = [seq.strip() for seq in args.extra_sequences.split(":")]
-        extra_parts = [seq for seq in extra_parts if seq]
-        if not extra_parts:
-            eprint("Error: --extra-sequences was provided but no sequence(s) could be parsed.")
+        extra_specs = [part.strip() for part in args.extra_sequences.split("::") if part.strip()]
+        if not extra_specs:
+            eprint("Error: --extra-sequences was provided but no NAME:SEQUENCE pair(s) could be parsed.")
             sys.exit(1)
 
         existing_ids = {sid for sid, _ in sequences}
         added_extra = []
-        next_extra_idx = 1
-        for seq in extra_parts:
-            seq_id = f"extra_sequence_{next_extra_idx}"
-            while seq_id in existing_ids:
-                next_extra_idx += 1
-                seq_id = f"extra_sequence_{next_extra_idx}"
+        for spec in extra_specs:
+            if ":" not in spec:
+                eprint(f"Error: invalid --extra-sequences entry '{spec}'. Expected NAME:SEQUENCE, "
+                       "with entries separated by double colon, e.g. NAME1:SEQ1::NAME2:SEQ2.")
+                sys.exit(1)
+
+            seq_id, seq = spec.split(":", 1)
+            seq_id = seq_id.strip()
+            seq = seq.strip()
+
+            if not seq_id:
+                eprint(f"Error: invalid --extra-sequences entry '{spec}': NAME is empty.")
+                sys.exit(1)
+            if not seq:
+                eprint(f"Error: invalid --extra-sequences entry '{spec}': SEQUENCE is empty.")
+                sys.exit(1)
+            if seq_id in existing_ids:
+                eprint(f"Error: duplicate sequence name '{seq_id}' from --extra-sequences. "
+                       "Extra sequence names must be unique and must not duplicate FASTA record names.")
+                sys.exit(1)
+
             existing_ids.add(seq_id)
             sequences.append((seq_id, seq))
             added_extra.append(seq_id)
-            next_extra_idx += 1
 
         vprint(f"Added {len(added_extra)} extra sequence(s) from --extra-sequences: {', '.join(added_extra)}")
 
@@ -465,8 +479,7 @@ def main():
         sys.exit(1)
 
     # 3b. Resolve --distogram-conditioning against all parsed sequence record names,
-    #     including extra_sequence_N entries appended from --extra-sequences.
-
+    #     including named records appended from --extra-sequences.
     #     Validated here, before the model is loaded, so mistakes fail fast.
     dc_names = []
     if args.distogram_conditioning:
