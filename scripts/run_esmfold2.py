@@ -322,9 +322,9 @@ def main():
     parser.add_argument("--json", default=None, 
                         help="JSON payload with heavy, light, and antigen sequences to evaluate directly")
     parser.add_argument("--extra-sequences", default=None, metavar="SEQ1:SEQ2",
-                        help="Colon-separated extra protein sequence(s) to append to the input FASTA records. "
-                             "Records are named extra_sequence_1, extra_sequence_2, etc. "
-                             "Example: --extra-sequences MSEQUENCE:ANOTHERSEQ")
+                        help="Colon-separated extra protein sequence(s) to append to the input FASTA records before "
+                             "validating --distogram-conditioning. Records are named extra_sequence_1, "
+                             "extra_sequence_2, etc. Example: --extra-sequences MSEQUENCE:ANOTHERSEQ")
     parser.add_argument("--tag", default="esf2", 
                         help="Tag for output files (default: esf2)")
     parser.add_argument("--outdir", default=None, 
@@ -434,6 +434,10 @@ def main():
         if seq_id:
             sequences.append((seq_id, "".join(seq_data)))
 
+    # 3a. Append command-line extra sequences before any downstream validation.
+    #     This is intentionally done before --distogram-conditioning is resolved so
+    #     extra_sequence_1, extra_sequence_2, ... count as normal chains when deciding
+    #     whether every chain has been conditioned.
     if args.extra_sequences:
         extra_parts = [seq.strip() for seq in args.extra_sequences.split(":")]
         extra_parts = [seq for seq in extra_parts if seq]
@@ -443,22 +447,26 @@ def main():
 
         existing_ids = {sid for sid, _ in sequences}
         added_extra = []
-        for idx, seq in enumerate(extra_parts, start=1):
-            seq_id = f"extra_sequence_{idx}"
+        next_extra_idx = 1
+        for seq in extra_parts:
+            seq_id = f"extra_sequence_{next_extra_idx}"
             while seq_id in existing_ids:
-                idx += 1
-                seq_id = f"extra_sequence_{idx}"
+                next_extra_idx += 1
+                seq_id = f"extra_sequence_{next_extra_idx}"
             existing_ids.add(seq_id)
             sequences.append((seq_id, seq))
             added_extra.append(seq_id)
+            next_extra_idx += 1
 
         vprint(f"Added {len(added_extra)} extra sequence(s) from --extra-sequences: {', '.join(added_extra)}")
 
     if not sequences:
-        eprint("Error: No sequences found in the input FASTA.")
+        eprint("Error: No sequences found in the input FASTA or --extra-sequences.")
         sys.exit(1)
 
-    # 3b. Resolve --distogram-conditioning against the FASTA record names.
+    # 3b. Resolve --distogram-conditioning against all parsed sequence record names,
+    #     including extra_sequence_N entries appended from --extra-sequences.
+
     #     Validated here, before the model is loaded, so mistakes fail fast.
     dc_names = []
     if args.distogram_conditioning:
@@ -476,8 +484,8 @@ def main():
 
         missing = [n for n in dc_names if n not in available]
         if missing:
-            eprint(f"Error: --distogram-conditioning name(s) not found in {in_path}: {', '.join(missing)}")
-            eprint(f"       Available record names: {', '.join(available)}")
+            eprint(f"Error: --distogram-conditioning name(s) not found in parsed input/extra sequences: {', '.join(missing)}")
+            eprint(f"       Available record names, including --extra-sequences: {', '.join(available)}")
             sys.exit(1)
 
         seen_dc = []
