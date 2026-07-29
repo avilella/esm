@@ -321,6 +321,10 @@ def main():
                         help="Input FASTA file containing one or more protein sequences")
     parser.add_argument("--json", default=None, 
                         help="JSON payload with heavy, light, and antigen sequences to evaluate directly")
+    parser.add_argument("--extra-sequences", default=None, metavar="SEQ1:SEQ2",
+                        help="Colon-separated extra protein sequence(s) to append to the input FASTA records. "
+                             "Records are named extra_sequence_1, extra_sequence_2, etc. "
+                             "Example: --extra-sequences MSEQUENCE:ANOTHERSEQ")
     parser.add_argument("--tag", default="esf2", 
                         help="Tag for output files (default: esf2)")
     parser.add_argument("--outdir", default=None, 
@@ -429,6 +433,26 @@ def main():
                 seq_data.append(line)
         if seq_id:
             sequences.append((seq_id, "".join(seq_data)))
+
+    if args.extra_sequences:
+        extra_parts = [seq.strip() for seq in args.extra_sequences.split(":")]
+        extra_parts = [seq for seq in extra_parts if seq]
+        if not extra_parts:
+            eprint("Error: --extra-sequences was provided but no sequence(s) could be parsed.")
+            sys.exit(1)
+
+        existing_ids = {sid for sid, _ in sequences}
+        added_extra = []
+        for idx, seq in enumerate(extra_parts, start=1):
+            seq_id = f"extra_sequence_{idx}"
+            while seq_id in existing_ids:
+                idx += 1
+                seq_id = f"extra_sequence_{idx}"
+            existing_ids.add(seq_id)
+            sequences.append((seq_id, seq))
+            added_extra.append(seq_id)
+
+        vprint(f"Added {len(added_extra)} extra sequence(s) from --extra-sequences: {', '.join(added_extra)}")
 
     if not sequences:
         eprint("Error: No sequences found in the input FASTA.")
