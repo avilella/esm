@@ -175,7 +175,9 @@ def main():
     amino_acids_str = seqs_str.replace(":", "")
     records = []
     
-    rate_limit_file = Path.home() / "biohub.api.txt"
+    # Hash the API token to create a unique, secure filename for rate limiting
+    token_hash = hashlib.md5(args.api_token.encode('utf-8')).hexdigest()
+    rate_limit_file = Path.home() / f"biohub.api.{token_hash}.txt"
 
     if args.verbose:
         eprint(f"\nFolding complex '{complex_id}' with {len(sequences)} chains...")
