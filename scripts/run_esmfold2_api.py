@@ -4,13 +4,14 @@ import csv
 import sys
 import hashlib
 import time
+import random
 from pathlib import Path
 
 # Import the ESM SDK as demonstrated in the esmfold2.py notebook
 try:
-    from esm.sdk import esmfold2_client #[cite: 3]
-    from esm.sdk.api import FoldingConfig, ESMProteinError #[cite: 3]
-    from esm.utils.structure import input_builder #[cite: 3]
+    from esm.sdk import esmfold2_client #
+    from esm.sdk.api import FoldingConfig, ESMProteinError #
+    from esm.utils.structure import input_builder #
 except ImportError:
     print(
         "Error: The 'esm' SDK package is not installed. "
@@ -60,7 +61,13 @@ def parse_args():
     parser.add_argument(
         "--api-token",
         required=True,
-        help="biohub.ai API key/token string for authentication.",
+        help="biohub.ai API key/token string(s) for authentication. Separate multiple keys with colons (key1:key2:key3).",
+    )
+    parser.add_argument(
+        "--spread",
+        type=int,
+        default=0,
+        help="Spread calls over 24h. Uses NN calls per key before semi-randomly waiting and rotating keys.",
     )
     parser.add_argument(
         "--num-loops",
@@ -156,18 +163,27 @@ def main():
         eprint(f"Error: No FASTA sequences found in '{input_path}'.")
         sys.exit(1)
 
+    api_keys = args.api_token.split(':')
+
     if args.verbose:
         eprint(
             f"Parsed {len(sequences)} chain(s) for complex folding: {list(sequences.keys())}. "
-            "Initializing Biohub API client..."
+            f"Found {len(api_keys)} API key(s). Initializing Biohub API clients..."
         )
 
-    # Initialize the Biohub client SDK
-    client = esmfold2_client(
-        model="esmfold2-2026-05", 
-        url="https://biohub.ai", 
-        token=args.api_token
-    ) #[cite: 3]
+    # Initialize a Biohub client SDK and rate limit file for each key
+    clients = {}
+    rate_limit_files = {}
+    for key in api_keys:
+        clients[key] = esmfold2_client(
+            model="esmfold2-2026-05", 
+            url="https://biohub.ai", 
+            token=key
+        ) #
+        
+        # Hash the API token to create a unique, secure filename for rate limiting
+        token_hash = hashlib.md5(key.encode('utf-8')).hexdigest()
+        rate_limit_files[key] = Path.home() / f"biohub.api.{token_hash}.txt"
 
     complex_id = input_path.stem
     chains_str = "+".join(sequences.keys())
@@ -175,15 +191,35 @@ def main():
     amino_acids_str = seqs_str.replace(":", "")
     records = []
     
-    # Hash the API token to create a unique, secure filename for rate limiting
-    token_hash = hashlib.md5(args.api_token.encode('utf-8')).hexdigest()
-    rate_limit_file = Path.home() / f"biohub.api.{token_hash}.txt"
+    current_key_idx = 0
+    calls_in_bucket = 0
 
     if args.verbose:
         eprint(f"\nFolding complex '{complex_id}' with {len(sequences)} chains...")
 
     for i in range(1, args.num_ensemble + 1):
         
+        # Implement '--spread NN' logic: Switch keys and wait semi-randomly if bucket is full
+        if args.spread > 0 and calls_in_bucket >= args.spread:
+            # Calculate wait time to spread the total expected calls evenly across 24h (86400 seconds)
+            total_buckets = (len(api_keys) * 100.0) / args.spread
+            base_wait = 86400.0 / total_buckets
+            wait_time = random.uniform(base_wait * 0.8, base_wait * 1.2)
+            
+            if args.verbose:
+                eprint(f"    Spread bucket of {args.spread} calls reached.")
+                eprint(f"    Sleeping for {wait_time:.2f} seconds before switching to the next API key...")
+            
+            time.sleep(wait_time)
+            
+            current_key_idx = (current_key_idx + 1) % len(api_keys)
+            calls_in_bucket = 0
+
+        # Select the active client and rate limit file for this iteration
+        current_key = api_keys[current_key_idx]
+        client = clients[current_key]
+        rate_limit_file = rate_limit_files[current_key]
+
         # Start with the original num_loops and num_sampling_steps, 
         # and increment num_sampling_steps by one for subsequent calls.
         current_num_loops = args.num_loops
@@ -194,18 +230,18 @@ def main():
             num_loops=current_num_loops,
             num_sampling_steps=current_num_sampling_steps,
             include_pae=True
-        ) #[cite: 3]
+        ) #
 
         # Build multi-chain protein complex input INSIDE the loop 
         # to ensure it is independent and not mutated by previous client calls
         protein_inputs = [
             input_builder.ProteinInput(id=seq_id, sequence=seq)
             for seq_id, seq in sequences.items()
-        ] #[cite: 3]
-        complex_input = input_builder.StructurePredictionInput(sequences=protein_inputs) #[cite: 3]
+        ] #
+        complex_input = input_builder.StructurePredictionInput(sequences=protein_inputs) #
 
         if args.verbose:
-            eprint(f"  Sampling complex fold {i}/{args.num_ensemble} via Biohub API...")
+            eprint(f"  Sampling complex fold {i}/{args.num_ensemble} via Biohub API (Key {current_key_idx + 1}/{len(api_keys)})...")
             eprint(f"    Parameters: num_loops={current_num_loops}, num_sampling_steps={current_num_sampling_steps}")
 
         # Cross-execution file-based throttling logic (20 calls/min, 100 calls/24h)
@@ -249,7 +285,7 @@ def main():
 
                 if sleep_time > 0:
                     if args.verbose:
-                        eprint(f"    API rate limit ({limit_reason}) reached. Sleeping for {sleep_time:.2f} seconds...")
+                        eprint(f"    API rate limit ({limit_reason}) reached for this key. Sleeping for {sleep_time:.2f} seconds...")
                     time.sleep(sleep_time)
                 else:
                     # Limits not reached; record current call and overwrite file
@@ -265,7 +301,10 @@ def main():
 
         try:
             # Call remote prediction service for all-atom complex structure
-            fold_result = client.fold_all_atom(complex_input, config=config) #[cite: 3]
+            fold_result = client.fold_all_atom(complex_input, config=config) #
+            
+            # Increment bucket counter on successful API execution
+            calls_in_bucket += 1
 
             # Check if the SDK returned an explicit ESMProteinError object
             if type(fold_result).__name__ == "ESMProteinError":
@@ -273,7 +312,7 @@ def main():
                 raise Exception(f"API Error: {error_msg}")
 
             # Export to mmCIF string format
-            cif_content = fold_result.complex.to_mmcif() #[cite: 3]
+            cif_content = fold_result.complex.to_mmcif() #
             
             # Compute MD5 Hash
             md5_hash = hashlib.md5(cif_content.encode('utf-8')).hexdigest()
@@ -286,10 +325,10 @@ def main():
             resolved_cif_path = str(cif_path.resolve())
 
             # Safely extract metrics
-            iptm_val = extract_metric(fold_result, 'iptm') #[cite: 3]
-            ptm_val = extract_metric(fold_result, 'ptm') #[cite: 3]
-            plddt_val = extract_metric(fold_result, 'plddt') #[cite: 3]
-            pae_val = extract_metric(fold_result, 'pae') #[cite: 3]
+            iptm_val = extract_metric(fold_result, 'iptm') #
+            ptm_val = extract_metric(fold_result, 'ptm') #
+            plddt_val = extract_metric(fold_result, 'plddt') #
+            pae_val = extract_metric(fold_result, 'pae') #
 
             # Append as a single record
             records.append({
