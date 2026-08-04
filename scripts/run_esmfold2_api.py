@@ -126,6 +126,185 @@ def extract_metric(obj, attr_name):
         return str(val)
 
 
+MAX_CALLS_PER_MINUTE = 20
+MAX_CALLS_PER_24H = 100
+MINUTE_SECONDS = 60.0
+DAY_SECONDS = 86400.0
+
+
+def parse_api_keys(api_token_arg):
+    """Return a cleaned list of colon-separated API keys."""
+    return [key.strip() for key in api_token_arg.split(":") if key.strip()]
+
+
+def read_rate_limit_timestamps(rate_limit_file, now, verbose=False):
+    """Read retained call timestamps for one key, keeping only the last 24h."""
+    timestamps = []
+    if not rate_limit_file.exists():
+        return timestamps
+
+    try:
+        with open(rate_limit_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ts = float(line)
+                except ValueError:
+                    continue
+                if now - ts < DAY_SECONDS:
+                    timestamps.append(ts)
+    except Exception as e:
+        if verbose:
+            eprint(f"    Warning: Error reading rate limit file '{rate_limit_file}': {e}")
+
+    timestamps.sort()
+    return timestamps
+
+
+def write_rate_limit_timestamps(rate_limit_file, timestamps, verbose=False):
+    """Persist retained timestamps for one key."""
+    try:
+        with open(rate_limit_file, "w") as f:
+            for ts in sorted(timestamps):
+                f.write(f"{ts}\n")
+    except Exception as e:
+        if verbose:
+            eprint(f"    Warning: Error writing rate limit file '{rate_limit_file}': {e}")
+
+
+def rate_limit_wait_seconds(timestamps, now):
+    """Return the sleep required before this key can be used, plus the reason."""
+    recent = [ts for ts in timestamps if now - ts < MINUTE_SECONDS]
+    sleep_time = 0.0
+    reason = ""
+
+    if len(timestamps) >= MAX_CALLS_PER_24H:
+        sleep_time = max(0.0, DAY_SECONDS - (now - timestamps[0]))
+        reason = f"{MAX_CALLS_PER_24H} calls/24h"
+
+    if len(recent) >= MAX_CALLS_PER_MINUTE:
+        minute_sleep = max(0.0, MINUTE_SECONDS - (now - recent[0]))
+        if minute_sleep > sleep_time:
+            sleep_time = minute_sleep
+            reason = f"{MAX_CALLS_PER_MINUTE} calls/min"
+
+    return sleep_time, reason
+
+
+def remaining_24h_capacity(timestamps):
+    """Call slots left within the 24h window for one key."""
+    return max(0, MAX_CALLS_PER_24H - len(timestamps))
+
+
+def shuffled_key_indices(api_keys, complex_id, bucket_id):
+    """
+    Deterministically shuffle the key order for a complex/bucket.
+
+    This keeps all samples inside the same --spread bucket pinned to the same
+    preferred key across reruns, while distributing different inputs/buckets
+    semi-randomly across the supplied key pool.
+    """
+    seed_material = f"{complex_id}|bucket:{bucket_id}|keys:{len(api_keys)}"
+    seed = int(hashlib.md5(seed_material.encode("utf-8")).hexdigest(), 16)
+    rng = random.Random(seed)
+    indices = list(range(len(api_keys)))
+    rng.shuffle(indices)
+    return indices
+
+
+def select_key_for_bucket(api_keys, rate_limit_files, complex_id, bucket_id, bucket_calls, args):
+    """
+    Pick one key for the whole spread bucket.
+
+    The function tries to choose a key that can accommodate the entire bucket
+    inside its remaining 24h capacity. If every key is exhausted for that bucket,
+    it sleeps only until the earliest key can accept the bucket, rather than
+    getting stuck on the first supplied key.
+    """
+    while True:
+        now = time.time()
+        preferred_order = shuffled_key_indices(api_keys, complex_id, bucket_id)
+        key_states = []
+
+        for idx in preferred_order:
+            key = api_keys[idx]
+            timestamps = read_rate_limit_timestamps(rate_limit_files[key], now, verbose=args.verbose)
+            day_capacity = remaining_24h_capacity(timestamps)
+            wait_time, wait_reason = rate_limit_wait_seconds(timestamps, now)
+            key_states.append((idx, key, timestamps, day_capacity, wait_time, wait_reason))
+
+        # Prefer keys with enough remaining 24h quota for the complete bucket.
+        day_eligible = [state for state in key_states if state[3] >= bucket_calls]
+        if day_eligible:
+            # Among day-eligible keys, prefer one not currently minute-limited.
+            immediately_available = [state for state in day_eligible if state[4] <= 0]
+            selected = immediately_available[0] if immediately_available else min(day_eligible, key=lambda state: state[4])
+            idx, key, _, day_capacity, wait_time, wait_reason = selected
+            if wait_time > 0:
+                if args.verbose:
+                    eprint(
+                        f"    Selected Key {idx + 1}/{len(api_keys)} for spread bucket {bucket_id + 1}, "
+                        f"but it is temporarily limited ({wait_reason}). Sleeping for {wait_time:.2f} seconds..."
+                    )
+                time.sleep(wait_time)
+            return idx, key
+
+        # No key can fit the whole bucket right now. Sleep until the earliest key
+        # can fit the complete bucket, preserving bucket-to-key consistency.
+        waits = []
+        for idx, key, timestamps, day_capacity, _, _ in key_states:
+            needed = bucket_calls - day_capacity
+            if needed <= 0:
+                waits.append((0.0, idx, key))
+            elif len(timestamps) >= needed:
+                waits.append((max(0.0, DAY_SECONDS - (now - timestamps[needed - 1])), idx, key))
+
+        if not waits:
+            raise RuntimeError("Could not compute API key availability from rate limit state.")
+
+        sleep_time, idx, _ = min(waits, key=lambda item: item[0])
+        if args.verbose:
+            eprint(
+                f"    No API key currently has enough 24h quota for this {bucket_calls}-call spread bucket. "
+                f"Sleeping for {sleep_time:.2f} seconds until Key {idx + 1}/{len(api_keys)} can accept it..."
+            )
+        time.sleep(sleep_time)
+
+
+def reserve_call_for_key(api_key, rate_limit_file, args):
+    """Reserve exactly one API call slot for the selected key."""
+    if args.ignore_limit:
+        return
+
+    while True:
+        now = time.time()
+        timestamps = read_rate_limit_timestamps(rate_limit_file, now, verbose=args.verbose)
+        sleep_time, reason = rate_limit_wait_seconds(timestamps, now)
+
+        if sleep_time > 0:
+            if args.verbose:
+                eprint(f"    Selected API key is rate limited ({reason}). Sleeping for {sleep_time:.2f} seconds...")
+            time.sleep(sleep_time)
+            continue
+
+        timestamps.append(now)
+        write_rate_limit_timestamps(rate_limit_file, timestamps, verbose=args.verbose)
+        return
+
+
+def spread_bucket_pause(api_key_count, spread):
+    """Semi-random pause between spread buckets over the pooled 24h capacity."""
+    if spread <= 0:
+        return 0.0
+    total_buckets = (api_key_count * float(MAX_CALLS_PER_24H)) / float(spread)
+    if total_buckets <= 0:
+        return 0.0
+    base_wait = DAY_SECONDS / total_buckets
+    return random.uniform(base_wait * 0.8, base_wait * 1.2)
+
+
 def main():
     args = parse_args()
 
@@ -163,7 +342,10 @@ def main():
         eprint(f"Error: No FASTA sequences found in '{input_path}'.")
         sys.exit(1)
 
-    api_keys = args.api_token.split(':')
+    api_keys = parse_api_keys(args.api_token)
+    if not api_keys:
+        eprint("Error: No non-empty API keys found in --api-token.")
+        sys.exit(1)
 
     if args.verbose:
         eprint(
@@ -176,11 +358,11 @@ def main():
     rate_limit_files = {}
     for key in api_keys:
         clients[key] = esmfold2_client(
-            model="esmfold2-2026-05", 
-            url="https://biohub.ai", 
+            model="esmfold2-2026-05",
+            url="https://biohub.ai",
             token=key
         ) #
-        
+
         # Hash the API token to create a unique, secure filename for rate limiting
         token_hash = hashlib.md5(key.encode('utf-8')).hexdigest()
         rate_limit_files[key] = Path.home() / f"biohub.api.{token_hash}.txt"
@@ -190,37 +372,64 @@ def main():
     seqs_str = ":".join(sequences.values())
     amino_acids_str = seqs_str.replace(":", "")
     records = []
-    
-    current_key_idx = 0
-    calls_in_bucket = 0
+
+    spread_size = args.spread if args.spread and args.spread > 0 else 1
+    active_bucket_id = None
+    active_key_idx = None
+    active_key = None
 
     if args.verbose:
         eprint(f"\nFolding complex '{complex_id}' with {len(sequences)} chains...")
+        if args.spread > 0:
+            eprint(
+                f"    Spread mode: assigning each {args.spread}-sample bucket to one key from the pooled "
+                f"{len(api_keys)}-key quota. Different buckets/inputs are distributed semi-randomly."
+            )
 
     for i in range(1, args.num_ensemble + 1):
-        
-        # Implement '--spread NN' logic: Switch keys and wait semi-randomly if bucket is full
-        if args.spread > 0 and calls_in_bucket >= args.spread:
-            # Calculate wait time to spread the total expected calls evenly across 24h (86400 seconds)
-            total_buckets = (len(api_keys) * 100.0) / args.spread
-            base_wait = 86400.0 / total_buckets
-            wait_time = random.uniform(base_wait * 0.8, base_wait * 1.2)
-            
-            if args.verbose:
-                eprint(f"    Spread bucket of {args.spread} calls reached.")
-                eprint(f"    Sleeping for {wait_time:.2f} seconds before switching to the next API key...")
-            
-            time.sleep(wait_time)
-            
-            current_key_idx = (current_key_idx + 1) % len(api_keys)
-            calls_in_bucket = 0
+        bucket_id = (i - 1) // spread_size
+        first_sample_in_bucket = bucket_id * spread_size + 1
+        last_sample_in_bucket = min(args.num_ensemble, (bucket_id + 1) * spread_size)
+        bucket_calls = last_sample_in_bucket - first_sample_in_bucket + 1
 
-        # Select the active client and rate limit file for this iteration
-        current_key = api_keys[current_key_idx]
+        if bucket_id != active_bucket_id:
+            if active_bucket_id is not None and args.spread > 0:
+                wait_time = spread_bucket_pause(len(api_keys), args.spread)
+                if args.verbose:
+                    eprint(
+                        f"    Spread bucket {active_bucket_id + 1} complete. "
+                        f"Sleeping for {wait_time:.2f} seconds before selecting the next pooled API key..."
+                    )
+                time.sleep(wait_time)
+
+            if args.ignore_limit:
+                preferred = shuffled_key_indices(api_keys, complex_id, bucket_id)[0]
+                active_key_idx = preferred
+                active_key = api_keys[active_key_idx]
+            else:
+                active_key_idx, active_key = select_key_for_bucket(
+                    api_keys=api_keys,
+                    rate_limit_files=rate_limit_files,
+                    complex_id=complex_id,
+                    bucket_id=bucket_id,
+                    bucket_calls=bucket_calls,
+                    args=args,
+                )
+            active_bucket_id = bucket_id
+
+            if args.verbose:
+                eprint(
+                    f"    Spread bucket {bucket_id + 1}: samples {first_sample_in_bucket}-{last_sample_in_bucket} "
+                    f"assigned to Key {active_key_idx + 1}/{len(api_keys)}."
+                )
+
+        # Select the active client and rate-limit file for this iteration.
+        current_key = active_key
+        current_key_idx = active_key_idx
         client = clients[current_key]
         rate_limit_file = rate_limit_files[current_key]
 
-        # Start with the original num_loops and num_sampling_steps, 
+        # Start with the original num_loops and num_sampling_steps,
         # and increment num_sampling_steps by one for subsequent calls.
         current_num_loops = args.num_loops
         current_num_sampling_steps = args.num_sampling_steps + (i - 1)
@@ -232,7 +441,7 @@ def main():
             include_pae=True
         ) #
 
-        # Build multi-chain protein complex input INSIDE the loop 
+        # Build multi-chain protein complex input INSIDE the loop
         # to ensure it is independent and not mutated by previous client calls
         protein_inputs = [
             input_builder.ProteinInput(id=seq_id, sequence=seq)
@@ -244,67 +453,14 @@ def main():
             eprint(f"  Sampling complex fold {i}/{args.num_ensemble} via Biohub API (Key {current_key_idx + 1}/{len(api_keys)})...")
             eprint(f"    Parameters: num_loops={current_num_loops}, num_sampling_steps={current_num_sampling_steps}")
 
-        # Cross-execution file-based throttling logic (20 calls/min, 100 calls/24h)
-        if not args.ignore_limit:
-            while True:
-                current_time = time.time()
-                timestamps = []
-                
-                # Read existing timestamps from the shared file
-                if rate_limit_file.exists():
-                    try:
-                        with open(rate_limit_file, "r") as f:
-                            for line in f:
-                                line = line.strip()
-                                if line:
-                                    ts = float(line)
-                                    # Only retain timestamps from the last 24 hours (86400 seconds)
-                                    if current_time - ts < 86400.0:
-                                        timestamps.append(ts)
-                    except Exception as e:
-                        if args.verbose:
-                            eprint(f"    Warning: Error reading rate limit file: {e}")
-                
-                timestamps.sort()
-                recent_timestamps = [ts for ts in timestamps if current_time - ts < 60.0]
-                
-                sleep_time = 0.0
-                limit_reason = ""
-                
-                # Check 24-hour limit (100 calls)
-                if len(timestamps) >= 100:
-                    sleep_time = 86400.0 - (current_time - timestamps[0])
-                    limit_reason = "100 calls/24h"
-                    
-                # Check 1-minute limit (20 calls)
-                if len(recent_timestamps) >= 20:
-                    minute_sleep = 60.0 - (current_time - recent_timestamps[0])
-                    if minute_sleep > sleep_time:
-                        sleep_time = minute_sleep
-                        limit_reason = "20 calls/min"
-
-                if sleep_time > 0:
-                    if args.verbose:
-                        eprint(f"    API rate limit ({limit_reason}) reached for this key. Sleeping for {sleep_time:.2f} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    # Limits not reached; record current call and overwrite file
-                    timestamps.append(current_time)
-                    try:
-                        with open(rate_limit_file, "w") as f:
-                            for ts in timestamps:
-                                f.write(f"{ts}\n")
-                    except Exception as e:
-                        if args.verbose:
-                            eprint(f"    Warning: Error writing to rate limit file: {e}")
-                    break
+        # Cross-execution file-based throttling logic (20 calls/min, 100 calls/24h).
+        # The key has already been selected from the pool; here we reserve one slot
+        # for that selected key without falling back to the first input key.
+        reserve_call_for_key(current_key, rate_limit_file, args)
 
         try:
             # Call remote prediction service for all-atom complex structure
             fold_result = client.fold_all_atom(complex_input, config=config) #
-            
-            # Increment bucket counter on successful API execution
-            calls_in_bucket += 1
 
             # Check if the SDK returned an explicit ESMProteinError object
             if type(fold_result).__name__ == "ESMProteinError":
@@ -313,7 +469,7 @@ def main():
 
             # Export to mmCIF string format
             cif_content = fold_result.complex.to_mmcif() #
-            
+
             # Compute MD5 Hash
             md5_hash = hashlib.md5(cif_content.encode('utf-8')).hexdigest()
 
@@ -361,7 +517,7 @@ def main():
     # Write output CSV mapping each CIF file to a unique row
     with open(out_file, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
-            "Name", "md5sum", "structure", "ComplexID", "Chains", "Sample", 
+            "Name", "md5sum", "structure", "ComplexID", "Chains", "Sample",
             "num_loops", "num_sampling_steps", "sequences", "Amino Acids",
             "iptm", "ptm", "mean_plddt", "mean_pae"
         ]
