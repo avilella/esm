@@ -1,130 +1,47 @@
 #!/usr/bin/env python3
+"""Generate reproducible ESMFold2 complex ensembles through the Biohub API.
+
+Key features
+------------
+* Full ESMFold2 quality defaults: 20 trunk loops and 100 ODE sampling steps.
+* Configurable inference-time ensemble over LM dropout, LM masking, MSA depth,
+  and MSA column masking while keeping each individual prediction high quality.
+* Optional per-chain A3M MSAs and chain-order replicas.
+* PAE and pair-chain iPTM output, interface-PAE summaries, and a reproducible
+  run-plan CSV written before API submission.
+* Multi-key rolling rate-limit accounting compatible with the original tool.
+* Backward-compatible core options and stdout behaviour: stdout contains only
+  the final summary CSV path.
+
+Install the current SDK with:
+    pip install 'esm@git+https://github.com/Biohub/esm.git@main'
+"""
+
 import argparse
 import csv
-import sys
 import hashlib
-import time
+import json
+import math
 import random
+import re
+import sys
+import time
+from collections import OrderedDict
+from itertools import permutations
 from pathlib import Path
 
-# Import the ESM SDK as demonstrated in the esmfold2.py notebook
 try:
-    from esm.sdk import esmfold2_client #
-    from esm.sdk.api import FoldingConfig, ESMProteinError #
-    from esm.utils.structure import input_builder #
+    from esm.sdk import esmfold2_client
+    from esm.sdk.api import FoldingConfig, ESMProteinError
+    from esm.utils.structure import input_builder
+    from esm.utils.msa import MSA
 except ImportError:
     print(
-        "Error: The 'esm' SDK package is not installed. "
-        "Please install it using: pip install esm@git+https://github.com/Biohub/esm.git@main",
+        "Error: the current 'esm' SDK is required. Install it with: "
+        "pip install 'esm@git+https://github.com/Biohub/esm.git@main'",
         file=sys.stderr,
     )
     sys.exit(1)
-
-
-def eprint(*args, **kwargs):
-    """Prints strictly to sys.stderr."""
-    print(*args, file=sys.stderr, **kwargs)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Submit ESMFold2 protein complex folding tasks using the biohub.ai client."
-    )
-
-    parser.add_argument(
-        "-i", "--inputfile", required=True, help="Input FASTA file containing protein chains of the complex."
-    )
-    parser.add_argument(
-        "--tag", default="esmf", help="Tag for the output file (default: esmf)."
-    )
-    parser.add_argument(
-        "--outdir",
-        default=None,
-        help="Output directory (default: same directory as inputfile).",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed progress and processing logs to sys.stderr.",
-    )
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Recalculate tasks even if non-empty output CSV already exists.",
-    )
-    parser.add_argument(
-        "--num-ensemble",
-        type=int,
-        default=5,
-        help="Number of CIF complex structures to generate in the ensemble (default: 5).",
-    )
-    parser.add_argument(
-        "--api-token",
-        required=True,
-        help="biohub.ai API key/token string(s) for authentication. Separate multiple keys with colons (key1:key2:key3).",
-    )
-    parser.add_argument(
-        "--spread",
-        type=int,
-        default=0,
-        help="Spread calls over 24h. Uses NN calls per key before semi-randomly waiting and rotating keys.",
-    )
-    parser.add_argument(
-        "--num-loops",
-        type=int,
-        default=10,
-        help="Number of refinement loops (default: 10).",
-    )
-    parser.add_argument(
-        "--num-sampling-steps",
-        type=int,
-        default=100,
-        help="Number of diffusion sampling steps (default: 100).",
-    )
-    parser.add_argument(
-        "--ignore-limit",
-        action="store_true",
-        help="Ignore the default API rate limits (20 calls/min, 100 calls/24h).",
-    )
-
-    return parser.parse_args()
-
-
-def read_fasta(file_path):
-    """Parses a FASTA file into a dictionary of ID -> sequence."""
-    sequences = {}
-    with open(file_path, "r", encoding="utf-8") as f:
-        curr_id = None
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                curr_id = line[1:].split()[0]
-                sequences[curr_id] = []
-            elif curr_id is not None:
-                sequences[curr_id].append(line)
-
-    for seq_id in sequences:
-        sequences[seq_id] = "".join(sequences[seq_id])
-
-    return sequences
-
-
-def extract_metric(obj, attr_name):
-    """Safely extracts and averages tensor metrics returned by the esm client."""
-    val = getattr(obj, attr_name, None)
-    if val is None:
-        return ""
-    if hasattr(val, "mean"):
-        val = val.mean()
-    if hasattr(val, "item"):
-        val = val.item()
-    try:
-        return f"{float(val):.4f}"
-    except (ValueError, TypeError):
-        return str(val)
-
 
 MAX_CALLS_PER_MINUTE = 20
 MAX_CALLS_PER_24H = 100
@@ -132,405 +49,483 @@ MINUTE_SECONDS = 60.0
 DAY_SECONDS = 86400.0
 
 
-def parse_api_keys(api_token_arg):
-    """Return a cleaned list of colon-separated API keys."""
-    return [key.strip() for key in api_token_arg.split(":") if key.strip()]
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
 
-def read_rate_limit_timestamps(rate_limit_file, now, verbose=False):
-    """Read retained call timestamps for one key, keeping only the last 24h."""
-    timestamps = []
-    if not rate_limit_file.exists():
-        return timestamps
-
-    try:
-        with open(rate_limit_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ts = float(line)
-                except ValueError:
-                    continue
-                if now - ts < DAY_SECONDS:
-                    timestamps.append(ts)
-    except Exception as e:
-        if verbose:
-            eprint(f"    Warning: Error reading rate limit file '{rate_limit_file}': {e}")
-
-    timestamps.sort()
-    return timestamps
-
-
-def write_rate_limit_timestamps(rate_limit_file, timestamps, verbose=False):
-    """Persist retained timestamps for one key."""
-    try:
-        with open(rate_limit_file, "w") as f:
-            for ts in sorted(timestamps):
-                f.write(f"{ts}\n")
-    except Exception as e:
-        if verbose:
-            eprint(f"    Warning: Error writing rate limit file '{rate_limit_file}': {e}")
-
-
-def rate_limit_wait_seconds(timestamps, now):
-    """Return the sleep required before this key can be used, plus the reason."""
-    recent = [ts for ts in timestamps if now - ts < MINUTE_SECONDS]
-    sleep_time = 0.0
-    reason = ""
-
-    if len(timestamps) >= MAX_CALLS_PER_24H:
-        sleep_time = max(0.0, DAY_SECONDS - (now - timestamps[0]))
-        reason = f"{MAX_CALLS_PER_24H} calls/24h"
-
-    if len(recent) >= MAX_CALLS_PER_MINUTE:
-        minute_sleep = max(0.0, MINUTE_SECONDS - (now - recent[0]))
-        if minute_sleep > sleep_time:
-            sleep_time = minute_sleep
-            reason = f"{MAX_CALLS_PER_MINUTE} calls/min"
-
-    return sleep_time, reason
-
-
-def remaining_24h_capacity(timestamps):
-    """Call slots left within the 24h window for one key."""
-    return max(0, MAX_CALLS_PER_24H - len(timestamps))
-
-
-def shuffled_key_indices(api_keys, complex_id, bucket_id):
-    """
-    Deterministically shuffle the key order for a complex/bucket.
-
-    This keeps all samples inside the same --spread bucket pinned to the same
-    preferred key across reruns, while distributing different inputs/buckets
-    semi-randomly across the supplied key pool.
-    """
-    seed_material = f"{complex_id}|bucket:{bucket_id}|keys:{len(api_keys)}"
-    seed = int(hashlib.md5(seed_material.encode("utf-8")).hexdigest(), 16)
-    rng = random.Random(seed)
-    indices = list(range(len(api_keys)))
-    rng.shuffle(indices)
-    return indices
-
-
-def select_key_for_bucket(api_keys, rate_limit_files, complex_id, bucket_id, bucket_calls, args):
-    """
-    Pick one key for the whole spread bucket.
-
-    The function tries to choose a key that can accommodate the entire bucket
-    inside its remaining 24h capacity. If every key is exhausted for that bucket,
-    it sleeps only until the earliest key can accept the bucket, rather than
-    getting stuck on the first supplied key.
-    """
-    while True:
-        now = time.time()
-        preferred_order = shuffled_key_indices(api_keys, complex_id, bucket_id)
-        key_states = []
-
-        for idx in preferred_order:
-            key = api_keys[idx]
-            timestamps = read_rate_limit_timestamps(rate_limit_files[key], now, verbose=args.verbose)
-            day_capacity = remaining_24h_capacity(timestamps)
-            wait_time, wait_reason = rate_limit_wait_seconds(timestamps, now)
-            key_states.append((idx, key, timestamps, day_capacity, wait_time, wait_reason))
-
-        # Prefer keys with enough remaining 24h quota for the complete bucket.
-        day_eligible = [state for state in key_states if state[3] >= bucket_calls]
-        if day_eligible:
-            # Among day-eligible keys, prefer one not currently minute-limited.
-            immediately_available = [state for state in day_eligible if state[4] <= 0]
-            selected = immediately_available[0] if immediately_available else min(day_eligible, key=lambda state: state[4])
-            idx, key, _, day_capacity, wait_time, wait_reason = selected
-            if wait_time > 0:
-                if args.verbose:
-                    eprint(
-                        f"    Selected Key {idx + 1}/{len(api_keys)} for spread bucket {bucket_id + 1}, "
-                        f"but it is temporarily limited ({wait_reason}). Sleeping for {wait_time:.2f} seconds..."
-                    )
-                time.sleep(wait_time)
-            return idx, key
-
-        # No key can fit the whole bucket right now. Sleep until the earliest key
-        # can fit the complete bucket, preserving bucket-to-key consistency.
-        waits = []
-        for idx, key, timestamps, day_capacity, _, _ in key_states:
-            needed = bucket_calls - day_capacity
-            if needed <= 0:
-                waits.append((0.0, idx, key))
-            elif len(timestamps) >= needed:
-                waits.append((max(0.0, DAY_SECONDS - (now - timestamps[needed - 1])), idx, key))
-
-        if not waits:
-            raise RuntimeError("Could not compute API key availability from rate limit state.")
-
-        sleep_time, idx, _ = min(waits, key=lambda item: item[0])
-        if args.verbose:
-            eprint(
-                f"    No API key currently has enough 24h quota for this {bucket_calls}-call spread bucket. "
-                f"Sleeping for {sleep_time:.2f} seconds until Key {idx + 1}/{len(api_keys)} can accept it..."
-            )
-        time.sleep(sleep_time)
-
-
-def reserve_call_for_key(api_key, rate_limit_file, args):
-    """Reserve exactly one API call slot for the selected key."""
-    if args.ignore_limit:
-        return
-
-    while True:
-        now = time.time()
-        timestamps = read_rate_limit_timestamps(rate_limit_file, now, verbose=args.verbose)
-        sleep_time, reason = rate_limit_wait_seconds(timestamps, now)
-
-        if sleep_time > 0:
-            if args.verbose:
-                eprint(f"    Selected API key is rate limited ({reason}). Sleeping for {sleep_time:.2f} seconds...")
-            time.sleep(sleep_time)
+def csv_values(text, cast, name, allow_none=False):
+    values = []
+    for raw in str(text).split(","):
+        raw = raw.strip()
+        if not raw:
             continue
+        if allow_none and raw.lower() in {"none", "null", "off"}:
+            values.append(None)
+            continue
+        try:
+            values.append(cast(raw))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"Invalid value {raw!r} in {name}") from exc
+    if not values:
+        raise argparse.ArgumentTypeError(f"{name} must contain at least one value")
+    return values
 
-        timestamps.append(now)
-        write_rate_limit_timestamps(rate_limit_file, timestamps, verbose=args.verbose)
-        return
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Submit a high-quality, diverse ESMFold2 protein-complex ensemble to Biohub.",
+    )
+    p.add_argument("-i", "--inputfile", required=True, help="Multi-record protein FASTA.")
+    p.add_argument("--tag", default="esmf", help="Output filename tag.")
+    p.add_argument("--outdir", default=None, help="Output directory; defaults to the FASTA directory.")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--refresh", action="store_true", help="Recalculate even if a non-empty summary exists.")
+    p.add_argument("--dry-run", action="store_true", help="Write the run plan without making API calls.")
+    p.add_argument("--num-ensemble", "--n-poses", dest="num_ensemble", type=int, default=10,
+                   help="Total API predictions to request.")
+    p.add_argument("--api-token", required=True,
+                   help="One or more Biohub tokens separated by colons.")
+    p.add_argument("--model", default="esmfold2-2026-05",
+                   choices=("esmfold2-2026-05", "esmfold2-fast-2026-05"))
+    p.add_argument("--num-loops", type=int, default=20, help="ESMFold2 trunk loops; API range 0-20.")
+    p.add_argument("--num-sampling-steps", type=int, default=100,
+                   help="Diffusion ODE steps; API range 1-100. Kept constant across poses.")
+    p.add_argument("--lm-dropouts", default="0.20,0.30",
+                   help="Comma-separated LM pair-embedding dropout probabilities.")
+    p.add_argument("--lm-mask-pcts", default="0.0",
+                   help="Comma-separated sequence-mask fractions; use 'none' for model default.")
+    p.add_argument("--msa-depths", default="1024",
+                   help="Comma-separated MSA subsampling depths; use 'none' to disable subsampling.")
+    p.add_argument("--msa-column-mask-rates", default="0.05,0.10,0.15",
+                   help="Comma-separated non-query MSA column-mask fractions.")
+    p.add_argument("--msa", action="append", default=[], metavar="CHAIN=FILE.a3m",
+                   help="Per-chain A3M. Repeat for multiple chains, e.g. --msa H=H.a3m --msa A=A.a3m.")
+    p.add_argument("--msa-load-max-sequences", type=int, default=16384,
+                   help="Maximum A3M rows loaded before server-side/inference subsampling.")
+    p.add_argument("--chain-order-mode", choices=("canonical", "reverse", "canonical,reverse", "all"),
+                   default="canonical,reverse",
+                   help="Input-chain serialization replicas. 'all' is capped by --max-chain-orders.")
+    p.add_argument("--max-chain-orders", type=int, default=6)
+    p.add_argument("--include-distogram", action="store_true")
+    p.add_argument("--include-embeddings", action="store_true")
+    p.add_argument("--no-pae", action="store_true", help="Do not request PAE (not recommended for complexes).")
+    p.add_argument("--no-pair-chains-iptm", action="store_true",
+                   help="Do not request pair-chain iPTM (not recommended for complexes).")
+    p.add_argument("--spread", type=int, default=0,
+                   help="Calls per key/bucket before rotating keys; 0 disables inter-bucket 24h spreading.")
+    p.add_argument("--ignore-limit", action="store_true",
+                   help="Disable local 20/min and 100/rolling-24h accounting.")
+    p.add_argument("--max-retries", type=int, default=3)
+    p.add_argument("--retry-base-seconds", type=float, default=15.0)
+    p.add_argument("--ranking-iptm-weight", type=float, default=0.55)
+    p.add_argument("--ranking-ptm-weight", type=float, default=0.25)
+    p.add_argument("--ranking-plddt-weight", type=float, default=0.20)
+    args = p.parse_args()
+
+    if args.num_ensemble < 1:
+        p.error("--num-ensemble must be >= 1")
+    if not 0 <= args.num_loops <= 20:
+        p.error("--num-loops must be in [0, 20]")
+    if not 1 <= args.num_sampling_steps <= 100:
+        p.error("--num-sampling-steps must be in [1, 100]")
+    if args.max_chain_orders < 1:
+        p.error("--max-chain-orders must be >= 1")
+    if args.msa_load_max_sequences < 1 or args.msa_load_max_sequences > 16384:
+        p.error("--msa-load-max-sequences must be in [1, 16384]")
+
+    args.lm_dropouts = csv_values(args.lm_dropouts, float, "--lm-dropouts")
+    args.lm_mask_pcts = csv_values(args.lm_mask_pcts, float, "--lm-mask-pcts", allow_none=True)
+    args.msa_depths = csv_values(args.msa_depths, int, "--msa-depths", allow_none=True)
+    args.msa_column_mask_rates = csv_values(
+        args.msa_column_mask_rates, float, "--msa-column-mask-rates"
+    )
+    for name, values in (("--lm-dropouts", args.lm_dropouts),
+                         ("--lm-mask-pcts", [x for x in args.lm_mask_pcts if x is not None]),
+                         ("--msa-column-mask-rates", args.msa_column_mask_rates)):
+        if any(x < 0 or x > 1 for x in values):
+            p.error(f"{name} values must be in [0, 1]")
+    if any(x is not None and not 1 <= x <= 16384 for x in args.msa_depths):
+        p.error("--msa-depths values must be in [1, 16384] or 'none'")
+    if args.model.endswith("-fast-2026-05") and args.msa:
+        p.error("Per-chain MSAs require --model esmfold2-2026-05, not the Fast model")
+    return args
 
 
-def spread_bucket_pause(api_key_count, spread):
-    """Semi-random pause between spread buckets over the pooled 24h capacity."""
-    if spread <= 0:
-        return 0.0
-    total_buckets = (api_key_count * float(MAX_CALLS_PER_24H)) / float(spread)
-    if total_buckets <= 0:
-        return 0.0
-    base_wait = DAY_SECONDS / total_buckets
-    return random.uniform(base_wait * 0.8, base_wait * 1.2)
+def read_fasta(path):
+    records = OrderedDict()
+    current = None
+    with open(path, encoding="utf-8") as handle:
+        for line_no, raw in enumerate(handle, 1):
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                current = line[1:].split()[0]
+                if not current:
+                    raise ValueError(f"Empty FASTA identifier at line {line_no}")
+                if current in records:
+                    raise ValueError(f"Duplicate FASTA identifier: {current}")
+                records[current] = []
+            elif current is None:
+                raise ValueError(f"Sequence before first FASTA header at line {line_no}")
+            else:
+                seq = re.sub(r"\s+", "", line).upper()
+                if not re.fullmatch(r"[A-Z*.-]+", seq):
+                    raise ValueError(f"Invalid FASTA sequence characters at line {line_no}")
+                records[current].append(seq)
+    sequences = OrderedDict((k, "".join(v).replace("*", "")) for k, v in records.items())
+    if not sequences or any(not seq for seq in sequences.values()):
+        raise ValueError("FASTA must contain at least one non-empty sequence")
+    return sequences
+
+
+def parse_msa_specs(specs, chain_ids, max_sequences):
+    paths = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(f"Invalid --msa {spec!r}; expected CHAIN=FILE.a3m")
+        chain, filename = spec.split("=", 1)
+        chain, path = chain.strip(), Path(filename).expanduser()
+        if chain not in chain_ids:
+            raise ValueError(f"MSA chain {chain!r} is not in FASTA chains: {', '.join(chain_ids)}")
+        if chain in paths:
+            raise ValueError(f"Duplicate --msa for chain {chain}")
+        if not path.is_file():
+            raise FileNotFoundError(f"MSA file not found: {path}")
+        paths[chain] = path
+    return {
+        chain: MSA.from_a3m(path=str(path), remove_insertions=True, max_sequences=max_sequences)
+        for chain, path in paths.items()
+    }, paths
+
+
+def chain_orders(chain_ids, mode, maximum):
+    canonical = tuple(chain_ids)
+    orders = [canonical]
+    if mode in {"reverse", "canonical,reverse"}:
+        orders = [tuple(reversed(canonical))] if mode == "reverse" else [canonical, tuple(reversed(canonical))]
+    elif mode == "all":
+        orders = list(permutations(canonical))
+    unique = []
+    for order in orders:
+        if order not in unique:
+            unique.append(order)
+    return unique[:maximum]
+
+
+def build_run_plan(args, sequences):
+    orders = chain_orders(list(sequences), args.chain_order_mode, args.max_chain_orders)
+    configs = []
+    for order in orders:
+        for dropout in args.lm_dropouts:
+            for mask_pct in args.lm_mask_pcts:
+                for depth in args.msa_depths:
+                    for column_mask in args.msa_column_mask_rates:
+                        configs.append({
+                            "chain_order": order,
+                            "lm_dropout": dropout,
+                            "lm_mask_pct": mask_pct,
+                            "msa_max_depth": depth,
+                            "msa_column_mask_rate": column_mask,
+                        })
+    if not configs:
+        raise ValueError("The ensemble parameter grid is empty")
+    plan = []
+    for index in range(args.num_ensemble):
+        cfg = dict(configs[index % len(configs)])
+        cfg["sample"] = index + 1
+        cfg["grid_cycle"] = index // len(configs) + 1
+        plan.append(cfg)
+    return plan
+
+
+def safe_scalar(value):
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "mean"):
+            value = value.mean()
+        if hasattr(value, "item"):
+            value = value.item()
+        return float(value)
+    except (TypeError, ValueError, RuntimeError):
+        return None
+
+
+def tensor_to_nested(value):
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "tolist"):
+            return value.tolist()
+    except (TypeError, RuntimeError):
+        pass
+    return value if isinstance(value, (list, tuple)) else None
+
+
+def pair_chain_iptm_json(result):
+    for attr in ("pair_chains_iptm", "pair_chain_iptm", "pairwise_iptm"):
+        raw = getattr(result, attr, None)
+        nested = tensor_to_nested(raw)
+        if nested is not None:
+            return json.dumps(nested, separators=(",", ":"))
+    return ""
+
+
+def interface_pae_summary(result, order, sequences):
+    """Return mean/max inter-chain PAE from a square residue-level PAE matrix."""
+    matrix = tensor_to_nested(getattr(result, "pae", None))
+    if not matrix or not isinstance(matrix, list):
+        return "", ""
+    lengths = [len(sequences[c]) for c in order]
+    total = sum(lengths)
+    if len(matrix) != total or any(not isinstance(row, list) or len(row) != total for row in matrix):
+        return "", ""
+    bounds, start = [], 0
+    for length in lengths:
+        bounds.append((start, start + length))
+        start += length
+    values = []
+    for i, (a0, a1) in enumerate(bounds):
+        for j, (b0, b1) in enumerate(bounds):
+            if i == j:
+                continue
+            for a in range(a0, a1):
+                for b in range(b0, b1):
+                    try:
+                        x = float(matrix[a][b])
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(x):
+                        values.append(x)
+    if not values:
+        return "", ""
+    return f"{sum(values) / len(values):.4f}", f"{max(values):.4f}"
+
+
+def parse_api_keys(text):
+    keys = [x.strip() for x in text.split(":") if x.strip()]
+    if not keys:
+        raise ValueError("No API tokens were supplied")
+    return keys
+
+
+def key_alias(key):
+    return hashlib.sha256(key.encode()).hexdigest()[:10]
+
+
+def read_timestamps(path, now):
+    if not path.exists():
+        return []
+    out = []
+    try:
+        for line in path.read_text().splitlines():
+            try:
+                ts = float(line)
+                if 0 <= now - ts < DAY_SECONDS:
+                    out.append(ts)
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    return sorted(out)
+
+
+def write_timestamps(path, timestamps):
+    path.write_text("".join(f"{x:.6f}\n" for x in sorted(timestamps)), encoding="utf-8")
+
+
+def wait_needed(timestamps, now):
+    waits = []
+    recent = [x for x in timestamps if now - x < MINUTE_SECONDS]
+    if len(recent) >= MAX_CALLS_PER_MINUTE:
+        waits.append(MINUTE_SECONDS - (now - recent[-MAX_CALLS_PER_MINUTE]) + 0.05)
+    if len(timestamps) >= MAX_CALLS_PER_24H:
+        waits.append(DAY_SECONDS - (now - timestamps[-MAX_CALLS_PER_24H]) + 0.05)
+    return max([0.0] + waits)
+
+
+def reserve_best_key(keys, files, sample, args):
+    if args.ignore_limit:
+        idx = (sample - 1) % len(keys)
+        return idx, keys[idx]
+    while True:
+        now = time.time()
+        states = []
+        # Stable rotation prevents always consuming token 1 first.
+        offset = int(hashlib.sha256(str(sample).encode()).hexdigest(), 16) % len(keys)
+        for rank in range(len(keys)):
+            idx = (offset + rank) % len(keys)
+            timestamps = read_timestamps(files[keys[idx]], now)
+            states.append((wait_needed(timestamps, now), len(timestamps), idx, timestamps))
+        wait, _, idx, timestamps = min(states)
+        if wait > 0:
+            if args.verbose:
+                eprint(f"All keys locally limited; sleeping {wait:.2f}s")
+            time.sleep(wait)
+            continue
+        timestamps.append(time.time())
+        write_timestamps(files[keys[idx]], timestamps)
+        return idx, keys[idx]
+
+
+def make_config(args, item):
+    return FoldingConfig(
+        include_distogram=args.include_distogram,
+        include_pae=not args.no_pae,
+        include_pair_chains_iptm=not args.no_pair_chains_iptm,
+        num_sampling_steps=args.num_sampling_steps,
+        num_loops=args.num_loops,
+        lm_dropout=item["lm_dropout"],
+        lm_mask_pct=item["lm_mask_pct"],
+        msa_max_depth=item["msa_max_depth"],
+        msa_column_mask_rate=item["msa_column_mask_rate"],
+        include_embeddings=args.include_embeddings,
+    )
+
+
+def write_plan(path, plan, args, msa_paths):
+    fields = ["sample", "grid_cycle", "model", "chain_order", "num_loops",
+              "num_sampling_steps", "lm_dropout", "lm_mask_pct", "msa_max_depth",
+              "msa_column_mask_rate", "msa_files"]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for item in plan:
+            writer.writerow({
+                "sample": item["sample"], "grid_cycle": item["grid_cycle"],
+                "model": args.model, "chain_order": ":".join(item["chain_order"]),
+                "num_loops": args.num_loops, "num_sampling_steps": args.num_sampling_steps,
+                "lm_dropout": item["lm_dropout"], "lm_mask_pct": item["lm_mask_pct"],
+                "msa_max_depth": item["msa_max_depth"],
+                "msa_column_mask_rate": item["msa_column_mask_rate"],
+                "msa_files": json.dumps({k: str(v.resolve()) for k, v in msa_paths.items()}, sort_keys=True),
+            })
 
 
 def main():
     args = parse_args()
-
-    input_path = Path(args.inputfile)
+    input_path = Path(args.inputfile).expanduser().resolve()
     if not input_path.is_file():
-        eprint(f"Error: Input file '{args.inputfile}' does not exist.")
-        sys.exit(1)
-
-    # Determine target output directory
-    if args.outdir:
-        outdir = Path(args.outdir)
-    else:
-        outdir = input_path.parent
-
+        raise SystemExit(f"Input FASTA not found: {input_path}")
+    outdir = Path(args.outdir).expanduser().resolve() if args.outdir else input_path.parent
     outdir.mkdir(parents=True, exist_ok=True)
-
-    # Construct output name: <input_stem>.<tag>.csv
-    out_file = outdir / f"{input_path.stem}.{args.tag}.csv"
-
-    # Refresh check: if output exists and is non-empty, skip execution
-    if not args.refresh:
-        if out_file.exists() and out_file.stat().st_size > 0:
-            if args.verbose:
-                eprint(f"Output file '{out_file}' already exists and is non-empty. Skipping computation.")
-            # Print ONLY the resolved path to STDOUT and exit cleanly
-            print(str(out_file.resolve()))
-            sys.exit(0)
-
-    if args.verbose:
-        eprint(f"Reading sequences from '{input_path}'...")
+    stem = input_path.stem
+    summary_path = outdir / f"{stem}.{args.tag}.csv"
+    plan_path = outdir / f"{stem}.{args.tag}.run_plan.csv"
+    if summary_path.exists() and summary_path.stat().st_size > 0 and not args.refresh:
+        print(str(summary_path.resolve()))
+        return
 
     sequences = read_fasta(input_path)
-
-    if not sequences:
-        eprint(f"Error: No FASTA sequences found in '{input_path}'.")
-        sys.exit(1)
+    complex_id = stem
+    msa_by_chain, msa_paths = parse_msa_specs(
+        args.msa, list(sequences), args.msa_load_max_sequences
+    )
+    plan = build_run_plan(args, sequences)
+    write_plan(plan_path, plan, args, msa_paths)
+    if args.verbose:
+        eprint(f"Run plan: {plan_path}")
+        eprint(f"Complex {complex_id}: {len(sequences)} chains, {sum(map(len, sequences.values()))} residues")
+        eprint(f"Model: {args.model}; poses: {len(plan)}; loops/steps: {args.num_loops}/{args.num_sampling_steps}")
+    if args.dry_run:
+        print(str(plan_path.resolve()))
+        return
 
     api_keys = parse_api_keys(args.api_token)
-    if not api_keys:
-        eprint("Error: No non-empty API keys found in --api-token.")
-        sys.exit(1)
-
-    if args.verbose:
-        eprint(
-            f"Parsed {len(sequences)} chain(s) for complex folding: {list(sequences.keys())}. "
-            f"Found {len(api_keys)} API key(s). Initializing Biohub API clients..."
-        )
-
-    # Initialize a Biohub client SDK and rate limit file for each key
-    clients = {}
-    rate_limit_files = {}
-    for key in api_keys:
-        clients[key] = esmfold2_client(
-            model="esmfold2-2026-05",
-            url="https://biohub.ai",
-            token=key
-        ) #
-
-        # Hash the API token to create a unique, secure filename for rate limiting
-        token_hash = hashlib.md5(key.encode('utf-8')).hexdigest()
-        rate_limit_files[key] = Path.home() / f"biohub.api.{token_hash}.txt"
-
-    complex_id = input_path.stem
-    chains_str = "+".join(sequences.keys())
-    seqs_str = ":".join(sequences.values())
-    amino_acids_str = seqs_str.replace(":", "")
+    clients = {key: esmfold2_client(model=args.model, token=key) for key in api_keys}
+    rate_files = {key: outdir / f".esmfold2_rate_limit_{key_alias(key)}.txt" for key in api_keys}
     records = []
 
-    spread_size = args.spread if args.spread and args.spread > 0 else 1
-    active_bucket_id = None
-    active_key_idx = None
-    active_key = None
-
-    if args.verbose:
-        eprint(f"\nFolding complex '{complex_id}' with {len(sequences)} chains...")
-        if args.spread > 0:
+    for item in plan:
+        sample = item["sample"]
+        key_idx, key = reserve_best_key(api_keys, rate_files, sample, args)
+        order = item["chain_order"]
+        config = make_config(args, item)
+        protein_inputs = [
+            input_builder.ProteinInput(id=chain, sequence=sequences[chain], msa=msa_by_chain.get(chain))
+            for chain in order
+        ]
+        structure_input = input_builder.StructurePredictionInput(sequences=protein_inputs)
+        if args.verbose:
             eprint(
-                f"    Spread mode: assigning each {args.spread}-sample bucket to one key from the pooled "
-                f"{len(api_keys)}-key quota. Different buckets/inputs are distributed semi-randomly."
+                f"[{sample}/{len(plan)}] key={key_idx + 1}/{len(api_keys)} order={':'.join(order)} "
+                f"dropout={item['lm_dropout']} mask={item['lm_mask_pct']} "
+                f"msa_depth={item['msa_max_depth']} msa_col_mask={item['msa_column_mask_rate']}"
             )
 
-    for i in range(1, args.num_ensemble + 1):
-        bucket_id = (i - 1) // spread_size
-        first_sample_in_bucket = bucket_id * spread_size + 1
-        last_sample_in_bucket = min(args.num_ensemble, (bucket_id + 1) * spread_size)
-        bucket_calls = last_sample_in_bucket - first_sample_in_bucket + 1
+        result = None
+        last_error = None
+        for attempt in range(args.max_retries + 1):
+            try:
+                result = clients[key].fold_all_atom(structure_input, config=config)
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= args.max_retries:
+                    break
+                delay = args.retry_base_seconds * (2 ** attempt) * random.uniform(0.8, 1.2)
+                eprint(f"  API attempt {attempt + 1} failed: {exc}; retrying after {delay:.2f}s")
+                time.sleep(delay)
+        if result is None:
+            eprint(f"Error: sample {sample} failed after retries: {last_error}")
+            continue
 
-        if bucket_id != active_bucket_id:
-            if active_bucket_id is not None and args.spread > 0:
-                wait_time = spread_bucket_pause(len(api_keys), args.spread)
-                if args.verbose:
-                    eprint(
-                        f"    Spread bucket {active_bucket_id + 1} complete. "
-                        f"Sleeping for {wait_time:.2f} seconds before selecting the next pooled API key..."
-                    )
-                time.sleep(wait_time)
+        cif_text = result.complex.to_mmcif()
+        md5sum = hashlib.md5(cif_text.encode("utf-8")).hexdigest()
+        cif_path = outdir / f"{stem}.{args.tag}.pose_{sample:04d}.{md5sum[:10]}.cif"
+        cif_path.write_text(cif_text, encoding="utf-8")
+        iptm = safe_scalar(getattr(result, "iptm", None))
+        ptm = safe_scalar(getattr(result, "ptm", None))
+        plddt = safe_scalar(getattr(result, "plddt", None))
+        pae = safe_scalar(getattr(result, "pae", None))
+        interface_mean, interface_max = interface_pae_summary(result, order, sequences)
+        components = ((args.ranking_iptm_weight, iptm),
+                      (args.ranking_ptm_weight, ptm),
+                      (args.ranking_plddt_weight, plddt))
+        available_weight = sum(w for w, value in components if value is not None)
+        rank_score = (sum(w * value for w, value in components if value is not None) / available_weight
+                      if available_weight else None)
+        records.append({
+            "Name": f"ESMF-{complex_id}-{md5sum}", "md5sum": md5sum,
+            "structure": str(cif_path.resolve()), "ComplexID": complex_id,
+            "Chains": ":".join(order), "Sample": sample, "grid_cycle": item["grid_cycle"],
+            "model": args.model, "api_key_alias": key_alias(key),
+            "num_loops": args.num_loops, "num_sampling_steps": args.num_sampling_steps,
+            "lm_dropout": item["lm_dropout"], "lm_mask_pct": item["lm_mask_pct"],
+            "msa_max_depth": item["msa_max_depth"],
+            "msa_column_mask_rate": item["msa_column_mask_rate"],
+            "msa_files": json.dumps({k: str(v.resolve()) for k, v in msa_paths.items()}, sort_keys=True),
+            "sequences": ":".join(sequences[c] for c in order),
+            "Amino Acids": ":".join(str(len(sequences[c])) for c in order),
+            "iptm": "" if iptm is None else f"{iptm:.6f}",
+            "pair_chains_iptm": pair_chain_iptm_json(result),
+            "ptm": "" if ptm is None else f"{ptm:.6f}",
+            "mean_plddt": "" if plddt is None else f"{plddt:.6f}",
+            "mean_pae": "" if pae is None else f"{pae:.6f}",
+            "mean_interface_pae": interface_mean, "max_interface_pae": interface_max,
+            "rank_score": "" if rank_score is None else f"{rank_score:.6f}",
+        })
 
-            if args.ignore_limit:
-                preferred = shuffled_key_indices(api_keys, complex_id, bucket_id)[0]
-                active_key_idx = preferred
-                active_key = api_keys[active_key_idx]
-            else:
-                active_key_idx, active_key = select_key_for_bucket(
-                    api_keys=api_keys,
-                    rate_limit_files=rate_limit_files,
-                    complex_id=complex_id,
-                    bucket_id=bucket_id,
-                    bucket_calls=bucket_calls,
-                    args=args,
-                )
-            active_bucket_id = bucket_id
-
-            if args.verbose:
-                eprint(
-                    f"    Spread bucket {bucket_id + 1}: samples {first_sample_in_bucket}-{last_sample_in_bucket} "
-                    f"assigned to Key {active_key_idx + 1}/{len(api_keys)}."
-                )
-
-        # Select the active client and rate-limit file for this iteration.
-        current_key = active_key
-        current_key_idx = active_key_idx
-        client = clients[current_key]
-        rate_limit_file = rate_limit_files[current_key]
-
-        # Start with the original num_loops and num_sampling_steps,
-        # and increment num_sampling_steps by one for subsequent calls.
-        current_num_loops = args.num_loops
-        current_num_sampling_steps = args.num_sampling_steps + (i - 1)
-
-        # Setup folding parameters
-        config = FoldingConfig(
-            num_loops=current_num_loops,
-            num_sampling_steps=current_num_sampling_steps,
-            include_pae=True
-        ) #
-
-        # Build multi-chain protein complex input INSIDE the loop
-        # to ensure it is independent and not mutated by previous client calls
-        protein_inputs = [
-            input_builder.ProteinInput(id=seq_id, sequence=seq)
-            for seq_id, seq in sequences.items()
-        ] #
-        complex_input = input_builder.StructurePredictionInput(sequences=protein_inputs) #
-
-        if args.verbose:
-            eprint(f"  Sampling complex fold {i}/{args.num_ensemble} via Biohub API (Key {current_key_idx + 1}/{len(api_keys)})...")
-            eprint(f"    Parameters: num_loops={current_num_loops}, num_sampling_steps={current_num_sampling_steps}")
-
-        # Cross-execution file-based throttling logic (20 calls/min, 100 calls/24h).
-        # The key has already been selected from the pool; here we reserve one slot
-        # for that selected key without falling back to the first input key.
-        reserve_call_for_key(current_key, rate_limit_file, args)
-
-        try:
-            # Call remote prediction service for all-atom complex structure
-            fold_result = client.fold_all_atom(complex_input, config=config) #
-
-            # Check if the SDK returned an explicit ESMProteinError object
-            if type(fold_result).__name__ == "ESMProteinError":
-                error_msg = getattr(fold_result, "error_msg", str(fold_result))
-                raise Exception(f"API Error: {error_msg}")
-
-            # Export to mmCIF string format
-            cif_content = fold_result.complex.to_mmcif() #
-
-            # Compute MD5 Hash
-            md5_hash = hashlib.md5(cif_content.encode('utf-8')).hexdigest()
-
-            # Save CIF locally
-            cif_path = outdir / f"{complex_id}_complex_sample_{i}.cif"
-            with open(cif_path, "w", encoding="utf-8") as f:
-                f.write(cif_content)
-
-            resolved_cif_path = str(cif_path.resolve())
-
-            # Safely extract metrics
-            iptm_val = extract_metric(fold_result, 'iptm') #
-            ptm_val = extract_metric(fold_result, 'ptm') #
-            plddt_val = extract_metric(fold_result, 'plddt') #
-            pae_val = extract_metric(fold_result, 'pae') #
-
-            # Append as a single record
-            records.append({
-                "Name": f"ESMF-{complex_id}-{md5_hash}",
-                "md5sum": md5_hash,
-                "structure": resolved_cif_path,
-                "ComplexID": complex_id,
-                "Chains": chains_str,
-                "Sample": str(i),
-                "num_loops": str(current_num_loops),
-                "num_sampling_steps": str(current_num_sampling_steps),
-                "sequences": seqs_str,
-                "Amino Acids": amino_acids_str,
-                "iptm": iptm_val,
-                "ptm": ptm_val,
-                "mean_plddt": plddt_val,
-                "mean_pae": pae_val
-            })
-
-            if args.verbose:
-                eprint(f"    Saved complex structure to: {resolved_cif_path}")
-                eprint(f"    MD5: {md5_hash} | ipTM: {iptm_val} | pTM: {ptm_val}")
-
-        except Exception as e:
-            eprint(f"    Error processing complex sample {i}: {e}")
-
-    if args.verbose:
-        eprint(f"\nWriting summary CSV to '{out_file}'...")
-
-    # Write output CSV mapping each CIF file to a unique row
-    with open(out_file, "w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "Name", "md5sum", "structure", "ComplexID", "Chains", "Sample",
-            "num_loops", "num_sampling_steps", "sequences", "Amino Acids",
-            "iptm", "ptm", "mean_plddt", "mean_pae"
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    fields = [
+        "Name", "md5sum", "structure", "ComplexID", "Chains", "Sample", "grid_cycle",
+        "model", "api_key_alias", "num_loops", "num_sampling_steps", "lm_dropout",
+        "lm_mask_pct", "msa_max_depth", "msa_column_mask_rate", "msa_files", "sequences",
+        "Amino Acids", "iptm", "pair_chains_iptm", "ptm", "mean_plddt", "mean_pae",
+        "mean_interface_pae", "max_interface_pae", "rank_score",
+    ]
+    with open(summary_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        for rec in records:
-            writer.writerow(rec)
-
+        writer.writerows(sorted(records, key=lambda r: float(r["rank_score"] or "-inf"), reverse=True))
     if args.verbose:
-        eprint("All tasks complete.")
-
-    # STDOUT output reserved exclusively for output CSV path
-    print(str(out_file.resolve()))
+        eprint(f"Completed {len(records)}/{len(plan)} predictions; summary: {summary_path}")
+    print(str(summary_path.resolve()))
 
 
 if __name__ == "__main__":
