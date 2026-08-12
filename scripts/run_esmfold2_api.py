@@ -350,28 +350,75 @@ def wait_needed(timestamps, now):
     return max([0.0] + waits)
 
 
-def reserve_best_key(keys, files, sample, args):
+def select_key_for_ensemble(keys, files, calls_needed, selector, args):
+    """Select one API key for the complete pose ensemble.
+
+    Selection happens once, outside the pose loop.  Prefer the key with the
+    fewest calls in the rolling 24-hour window that can accommodate the whole
+    ensemble.  A stable selector only breaks ties, so successive script
+    invocations naturally move to less-used keys rather than rotating keys
+    between poses.
+    """
+    if calls_needed > MAX_CALLS_PER_24H and not args.ignore_limit:
+        raise ValueError(
+            f"A single ensemble requests {calls_needed} calls, but the local "
+            f"per-key rolling-24h limit is {MAX_CALLS_PER_24H}."
+        )
     if args.ignore_limit:
-        idx = (sample - 1) % len(keys)
+        idx = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
         return idx, keys[idx]
+
     while True:
         now = time.time()
         states = []
         # Stable rotation prevents always consuming token 1 first.
-        offset = int(hashlib.sha256(str(sample).encode()).hexdigest(), 16) % len(keys)
+        offset = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
         for rank in range(len(keys)):
             idx = (offset + rank) % len(keys)
             timestamps = read_timestamps(files[keys[idx]], now)
-            states.append((wait_needed(timestamps, now), len(timestamps), idx, timestamps))
-        wait, _, idx, timestamps = min(states)
+            remaining = MAX_CALLS_PER_24H - len(timestamps)
+            states.append((remaining >= calls_needed, len(timestamps), rank, idx, timestamps))
+
+        eligible = [state for state in states if state[0]]
+        if eligible:
+            _, _, _, idx, _ = min(eligible, key=lambda state: (state[1], state[2]))
+            return idx, keys[idx]
+
+        # No key currently has room for the complete ensemble. Sleep until the
+        # earliest key has enough rolling-24h slots, then re-evaluate all keys.
+        waits = []
+        for _, _, rank, idx, timestamps in states:
+            slots_to_free = calls_needed - (MAX_CALLS_PER_24H - len(timestamps))
+            if slots_to_free <= 0:
+                waits.append((0.0, rank, idx))
+            else:
+                expiry = timestamps[slots_to_free - 1] + DAY_SECONDS + 0.05
+                waits.append((max(0.0, expiry - now), rank, idx))
+        sleep_seconds, _, _ = min(waits)
+        if args.verbose:
+            eprint(
+                "No key can currently accommodate the complete "
+                f"{calls_needed}-pose ensemble; sleeping {sleep_seconds:.2f}s"
+            )
+        time.sleep(sleep_seconds)
+
+
+def reserve_call_on_key(key, rate_file, args):
+    """Reserve one call on an already selected ensemble key."""
+    if args.ignore_limit:
+        return
+    while True:
+        now = time.time()
+        timestamps = read_timestamps(rate_file, now)
+        wait = wait_needed(timestamps, now)
         if wait > 0:
             if args.verbose:
-                eprint(f"All keys locally limited; sleeping {wait:.2f}s")
+                eprint(f"Selected ensemble key is locally limited; sleeping {wait:.2f}s")
             time.sleep(wait)
             continue
         timestamps.append(time.time())
-        write_timestamps(files[keys[idx]], timestamps)
-        return idx, keys[idx]
+        write_timestamps(rate_file, timestamps)
+        return
 
 
 def make_config(args, item):
@@ -442,9 +489,27 @@ def main():
     rate_files = {key: outdir / f".esmfold2_rate_limit_{key_alias(key)}.txt" for key in api_keys}
     records = []
 
+    # Select exactly one key for this input's complete pose ensemble.  This is
+    # deliberately outside the pose loop: --n-poses 10 now performs all ten
+    # predictions with this key.  The next script invocation selects again,
+    # normally preferring another, less-used key.
+    ensemble_key_idx, ensemble_key = select_key_for_ensemble(
+        api_keys,
+        rate_files,
+        calls_needed=len(plan),
+        selector=f"{complex_id}:{len(plan)}",
+        args=args,
+    )
+    ensemble_client = clients[ensemble_key]
+    ensemble_rate_file = rate_files[ensemble_key]
+    if args.verbose:
+        eprint(
+            f"Selected key={ensemble_key_idx + 1}/{len(api_keys)} for all "
+            f"{len(plan)} poses in complex {complex_id}"
+        )
+
     for item in plan:
         sample = item["sample"]
-        key_idx, key = reserve_best_key(api_keys, rate_files, sample, args)
         order = item["chain_order"]
         config = make_config(args, item)
         protein_inputs = [
@@ -454,16 +519,18 @@ def main():
         structure_input = input_builder.StructurePredictionInput(sequences=protein_inputs)
         if args.verbose:
             eprint(
-                f"[{sample}/{len(plan)}] key={key_idx + 1}/{len(api_keys)} order={':'.join(order)} "
+                f"[{sample}/{len(plan)}] key={ensemble_key_idx + 1}/{len(api_keys)} order={':'.join(order)} "
                 f"dropout={item['lm_dropout']} mask={item['lm_mask_pct']} "
                 f"msa_depth={item['msa_max_depth']} msa_col_mask={item['msa_column_mask_rate']}"
             )
+
+        reserve_call_on_key(ensemble_key, ensemble_rate_file, args)
 
         result = None
         last_error = None
         for attempt in range(args.max_retries + 1):
             try:
-                result = clients[key].fold_all_atom(structure_input, config=config)
+                result = ensemble_client.fold_all_atom(structure_input, config=config)
                 break
             except Exception as exc:
                 last_error = exc
@@ -495,7 +562,7 @@ def main():
             "Name": f"ESMF-{complex_id}-{md5sum}", "md5sum": md5sum,
             "structure": str(cif_path.resolve()), "ComplexID": complex_id,
             "Chains": ":".join(order), "Sample": sample, "grid_cycle": item["grid_cycle"],
-            "model": args.model, "api_key_alias": key_alias(key),
+            "model": args.model, "api_key_alias": key_alias(ensemble_key),
             "num_loops": args.num_loops, "num_sampling_steps": args.num_sampling_steps,
             "lm_dropout": item["lm_dropout"], "lm_mask_pct": item["lm_mask_pct"],
             "msa_max_depth": item["msa_max_depth"],
