@@ -76,7 +76,8 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Submit a high-quality, diverse ESMFold2 protein-complex ensemble to Biohub.",
     )
-    p.add_argument("-i", "--inputfile", required=True, help="Multi-record protein FASTA.")
+    p.add_argument("-i", "--inputfile", help="Multi-record protein FASTA. Required unless --test-availability is used.")
+    p.add_argument("--test-availability", action="store_true", help="Summarize how many calls for each API token can be made based on local timestamp records and exit.")
     p.add_argument("--tag", default="esmf", help="Output filename tag.")
     p.add_argument("--outdir", default=None, help="Output directory; defaults to the FASTA directory.")
     p.add_argument("--verbose", action="store_true")
@@ -122,6 +123,9 @@ def parse_args():
     p.add_argument("--ranking-ptm-weight", type=float, default=0.25)
     p.add_argument("--ranking-plddt-weight", type=float, default=0.20)
     args = p.parse_args()
+
+    if not args.test_availability and not args.inputfile:
+        p.error("-i/--inputfile is required unless --test-availability is used.")
 
     if args.num_ensemble < 1:
         p.error("--num-ensemble must be >= 1")
@@ -457,6 +461,49 @@ def write_plan(path, plan, args, msa_paths):
 
 def main():
     args = parse_args()
+    
+    # Handle the --test-availability early exit flag
+    if args.test_availability:
+        api_keys = parse_api_keys(args.api_token)
+        
+        # Determine the outdir so we look for the limit files in the correct place
+        if args.outdir:
+            outdir = Path(args.outdir).expanduser().resolve()
+        elif args.inputfile:
+            outdir = Path(args.inputfile).expanduser().resolve().parent
+        else:
+            outdir = Path(".").resolve()
+            
+        now = time.time()
+        print(f"{'Token Alias':<15} | {'1-Min Capacity':<16} | {'24-Hour Capacity':<18} | {'Rate File'}")
+        print("-" * 80)
+        
+        total_min_avail = 0
+        total_min_max = 0
+        total_day_avail = 0
+        total_day_max = 0
+        
+        for key in api_keys:
+            alias = key_alias(key)
+            rate_file = outdir / f".esmfold2_rate_limit_{alias}.txt"
+            
+            timestamps = read_timestamps(rate_file, now)
+            recent = [x for x in timestamps if now - x < MINUTE_SECONDS]
+            
+            min_avail = max(0, MAX_CALLS_PER_MINUTE - len(recent))
+            day_avail = max(0, MAX_CALLS_PER_24H - len(timestamps))
+            
+            total_min_avail += min_avail
+            total_min_max += MAX_CALLS_PER_MINUTE
+            total_day_avail += day_avail
+            total_day_max += MAX_CALLS_PER_24H
+            
+            print(f"{alias:<15} | {min_avail:>2} / {MAX_CALLS_PER_MINUTE:<11} | {day_avail:>3} / {MAX_CALLS_PER_24H:<12} | {rate_file.name}")
+        
+        print("-" * 80)
+        print(f"{'TOTAL':<15} | {total_min_avail:>2} / {total_min_max:<11} | {total_day_avail:>3} / {total_day_max:<12} |")
+        return
+
     input_path = Path(args.inputfile).expanduser().resolve()
     if not input_path.is_file():
         raise SystemExit(f"Input FASTA not found: {input_path}")
