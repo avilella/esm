@@ -320,7 +320,14 @@ def parse_api_keys(text):
 
 
 def key_alias(key):
-    return hashlib.sha256(key.encode()).hexdigest()[:10]
+    # Used for display and output CSV matching the first 10 chars of SHA-256
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+
+
+def get_rate_file(key):
+    # Generates a path in $HOME formatted as biohub.api.<md5_hash>.txt
+    md5_hash = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return Path.home() / f"biohub.api.{md5_hash}.txt"
 
 
 def read_timestamps(path, now):
@@ -355,14 +362,7 @@ def wait_needed(timestamps, now):
 
 
 def select_key_for_ensemble(keys, files, calls_needed, selector, args):
-    """Select one API key for the complete pose ensemble.
-
-    Selection happens once, outside the pose loop.  Prefer the key with the
-    fewest calls in the rolling 24-hour window that can accommodate the whole
-    ensemble.  A stable selector only breaks ties, so successive script
-    invocations naturally move to less-used keys rather than rotating keys
-    between poses.
-    """
+    """Select one API key for the complete pose ensemble."""
     if calls_needed > MAX_CALLS_PER_24H and not args.ignore_limit:
         raise ValueError(
             f"A single ensemble requests {calls_needed} calls, but the local "
@@ -375,7 +375,6 @@ def select_key_for_ensemble(keys, files, calls_needed, selector, args):
     while True:
         now = time.time()
         states = []
-        # Stable rotation prevents always consuming token 1 first.
         offset = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
         for rank in range(len(keys)):
             idx = (offset + rank) % len(keys)
@@ -388,8 +387,6 @@ def select_key_for_ensemble(keys, files, calls_needed, selector, args):
             _, _, _, idx, _ = min(eligible, key=lambda state: (state[1], state[2]))
             return idx, keys[idx]
 
-        # No key currently has room for the complete ensemble. Sleep until the
-        # earliest key has enough rolling-24h slots, then re-evaluate all keys.
         waits = []
         for _, _, rank, idx, timestamps in states:
             slots_to_free = calls_needed - (MAX_CALLS_PER_24H - len(timestamps))
@@ -465,14 +462,6 @@ def main():
     # Handle the --test-availability early exit flag
     if args.test_availability:
         api_keys = parse_api_keys(args.api_token)
-        
-        # Determine the outdir so we look for the limit files in the correct place
-        if args.outdir:
-            outdir = Path(args.outdir).expanduser().resolve()
-        elif args.inputfile:
-            outdir = Path(args.inputfile).expanduser().resolve().parent
-        else:
-            outdir = Path(".").resolve()
             
         now = time.time()
         print(f"{'Token Alias':<15} | {'1-Min Capacity':<16} | {'24-Hour Capacity':<18} | {'Rate File'}")
@@ -485,7 +474,7 @@ def main():
         
         for key in api_keys:
             alias = key_alias(key)
-            rate_file = outdir / f".esmfold2_rate_limit_{alias}.txt"
+            rate_file = get_rate_file(key)
             
             timestamps = read_timestamps(rate_file, now)
             recent = [x for x in timestamps if now - x < MINUTE_SECONDS]
@@ -533,13 +522,11 @@ def main():
 
     api_keys = parse_api_keys(args.api_token)
     clients = {key: esmfold2_client(model=args.model, token=key) for key in api_keys}
-    rate_files = {key: outdir / f".esmfold2_rate_limit_{key_alias(key)}.txt" for key in api_keys}
+    
+    # Store and map local limits accurately to $HOME with the biohub.api.<md5>.txt format
+    rate_files = {key: get_rate_file(key) for key in api_keys}
     records = []
 
-    # Select exactly one key for this input's complete pose ensemble.  This is
-    # deliberately outside the pose loop: --n-poses 10 now performs all ten
-    # predictions with this key.  The next script invocation selects again,
-    # normally preferring another, less-used key.
     ensemble_key_idx, ensemble_key = select_key_for_ensemble(
         api_keys,
         rate_files,
