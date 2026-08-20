@@ -18,6 +18,7 @@ Install the current SDK with:
 """
 
 import argparse
+import dataclasses
 import csv
 import hashlib
 import json
@@ -26,6 +27,7 @@ import random
 import re
 import sys
 import time
+import traceback
 from collections import OrderedDict
 from itertools import permutations
 from pathlib import Path
@@ -51,6 +53,52 @@ DAY_SECONDS = 86400.0
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+
+def diagnostic_payload(value):
+    """Return a JSON-safe diagnostic view without assuming SDK error fields."""
+    payload = {
+        "type": f"{type(value).__module__}.{type(value).__qualname__}",
+        "str": str(value),
+        "repr": repr(value),
+    }
+    try:
+        if dataclasses.is_dataclass(value):
+            payload["dataclass"] = dataclasses.asdict(value)
+    except Exception as exc:
+        payload["dataclass_inspection_error"] = repr(exc)
+    try:
+        attrs = vars(value)
+    except TypeError:
+        attrs = None
+    if attrs:
+        payload["attributes"] = {
+            str(k): diagnostic_json_value(v) for k, v in attrs.items()
+            if not str(k).lower().endswith(("token", "api_key", "authorization"))
+        }
+    for name in ("error_code", "code", "status", "status_code", "message", "msg", "detail", "reason"):
+        if hasattr(value, name):
+            try:
+                payload[name] = diagnostic_json_value(getattr(value, name))
+            except Exception as exc:
+                payload[f"{name}_inspection_error"] = repr(exc)
+    return payload
+
+
+def diagnostic_json_value(value):
+    """Best-effort conversion for diagnostic JSON; never serializes huge tensors."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): diagnostic_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [diagnostic_json_value(v) for v in value[:100]]
+    return repr(value)
+
+
+def append_jsonl(path, payload):
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, default=repr) + "\n")
 
 
 def csv_values(text, cast, name, allow_none=False):
@@ -562,22 +610,101 @@ def main():
 
         result = None
         last_error = None
+        error_log_path = outdir / f"{stem}.{args.tag}.errors.jsonl"
         for attempt in range(args.max_retries + 1):
+            attempt_started = time.monotonic()
             try:
-                result = ensemble_client.fold_all_atom(structure_input, config=config)
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt >= args.max_retries:
+                if args.verbose:
+                    eprint(f"  API attempt {attempt + 1}/{args.max_retries + 1}: submitting")
+                candidate = ensemble_client.fold_all_atom(structure_input, config=config)
+                elapsed = time.monotonic() - attempt_started
+                if isinstance(candidate, ESMProteinError):
+                    last_error = candidate
+                    event = {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "complex_id": complex_id,
+                        "sample": sample,
+                        "attempt": attempt + 1,
+                        "elapsed_seconds": round(elapsed, 3),
+                        "api_key_alias": key_alias(ensemble_key),
+                        "model": args.model,
+                        "input_residues": sum(len(sequences[c]) for c in order),
+                        "chain_order": list(order),
+                        "config": {
+                            "num_loops": args.num_loops,
+                            "num_sampling_steps": args.num_sampling_steps,
+                            "lm_dropout": item["lm_dropout"],
+                            "lm_mask_pct": item["lm_mask_pct"],
+                            "msa_max_depth": item["msa_max_depth"],
+                            "msa_column_mask_rate": item["msa_column_mask_rate"],
+                        },
+                        "error": diagnostic_payload(candidate),
+                    }
+                    append_jsonl(error_log_path, event)
+                    eprint(
+                        f"  API returned ESMProteinError after {elapsed:.2f}s: "
+                        f"{json.dumps(event['error'], sort_keys=True, default=repr)}"
+                    )
+                elif not hasattr(candidate, "complex"):
+                    last_error = TypeError(
+                        f"Unexpected API result type {type(candidate).__module__}."
+                        f"{type(candidate).__qualname__}; missing 'complex'"
+                    )
+                    event = {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "complex_id": complex_id, "sample": sample, "attempt": attempt + 1,
+                        "elapsed_seconds": round(elapsed, 3),
+                        "api_key_alias": key_alias(ensemble_key),
+                        "result": diagnostic_payload(candidate),
+                    }
+                    append_jsonl(error_log_path, event)
+                    eprint(f"  {last_error}: {json.dumps(event['result'], sort_keys=True, default=repr)}")
+                else:
+                    result = candidate
+                    if args.verbose:
+                        eprint(f"  API attempt {attempt + 1} succeeded in {elapsed:.2f}s")
                     break
+            except Exception as exc:
+                elapsed = time.monotonic() - attempt_started
+                last_error = exc
+                event = {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "complex_id": complex_id, "sample": sample, "attempt": attempt + 1,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "api_key_alias": key_alias(ensemble_key),
+                    "exception": diagnostic_payload(exc),
+                    "traceback": traceback.format_exc(),
+                }
+                append_jsonl(error_log_path, event)
+                eprint(f"  API attempt {attempt + 1} raised {type(exc).__name__}: {exc}")
+                if args.verbose:
+                    eprint(event["traceback"].rstrip())
+            if attempt < args.max_retries:
                 delay = args.retry_base_seconds * (2 ** attempt) * random.uniform(0.8, 1.2)
-                eprint(f"  API attempt {attempt + 1} failed: {exc}; retrying after {delay:.2f}s")
+                eprint(f"  Retrying after {delay:.2f}s; diagnostics: {error_log_path}")
                 time.sleep(delay)
         if result is None:
-            eprint(f"Error: sample {sample} failed after retries: {last_error}")
+            eprint(
+                f"Error: sample {sample} failed after {args.max_retries + 1} attempts; "
+                f"last error={last_error!r}; diagnostics={error_log_path}"
+            )
             continue
 
-        cif_text = result.complex.to_mmcif()
+        try:
+            cif_text = result.complex.to_mmcif()
+        except Exception as exc:
+            event = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "complex_id": complex_id, "sample": sample,
+                "stage": "to_mmcif", "api_key_alias": key_alias(ensemble_key),
+                "exception": diagnostic_payload(exc), "result": diagnostic_payload(result),
+                "traceback": traceback.format_exc(),
+            }
+            append_jsonl(error_log_path, event)
+            eprint(f"Error: sample {sample} could not be serialized to mmCIF: {exc!r}; diagnostics={error_log_path}")
+            if args.verbose:
+                eprint(event["traceback"].rstrip())
+            continue
         md5sum = hashlib.md5(cif_text.encode("utf-8")).hexdigest()
         cif_path = outdir / f"{stem}.{args.tag}.pose_{sample:04d}.{md5sum[:10]}.cif"
         cif_path.write_text(cif_text, encoding="utf-8")
