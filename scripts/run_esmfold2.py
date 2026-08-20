@@ -337,6 +337,13 @@ def main():
                         help="Compute budget in minutes (enforces a wall-clock limit on diffusion sampling loops)")
     parser.add_argument("--ensemble", type=int, default=1,
                         help="Produce a full ensemble of N predictions instead of one")
+    parser.add_argument("--model", default="biohub/ESMFold2",
+                        choices=("biohub/ESMFold2", "biohub/ESMFold2-Fast"),
+                        help="Local Hugging Face model checkpoint")
+    parser.add_argument("--num-loops", type=int, default=20,
+                        help="Recurrent folding loops; reduce first to lower runtime")
+    parser.add_argument("--num-sampling-steps", type=int, default=100,
+                        help="Requested diffusion schedule steps; 68 is a strong efficient starting point")
     parser.add_argument("--activation-checkpointing", action="store_true",
                         help="Enable activation checkpointing on the model transformer blocks to reduce peak VRAM usage")
     parser.add_argument("--msa_max_depth", type=int, default=1024,
@@ -526,8 +533,14 @@ def main():
         max_iterations = args.ensemble
         vprint(f"No budget provided. Defaulting to {max_iterations} diffusion sample(s).")
         
-    num_loops = 20
-    num_sampling_steps = 100
+    num_loops = args.num_loops
+    num_sampling_steps = args.num_sampling_steps
+    total_residues = sum(len(seq.replace("|", "").replace(":", "")) for _, seq in sequences)
+    vprint(f"Input: {len(sequences)} chain(s), {total_residues} total residues")
+    if total_residues > 768:
+        eprint(f"Note: {total_residues} residues exceeds the hosted API limit of 768; using local inference.")
+        eprint("Memory-conservative order: ESMFold2-Fast, MSA depth 1, one ensemble member, "
+               "10 loops/68 steps; then increase loops, steps, and MSA depth only after a successful run.")
     
     run_params = {
         "BUDGET_MIN": args.budget_min if args.budget_min is not None else "None",
@@ -535,7 +548,8 @@ def main():
         "NUM_LOOPS": num_loops,
         "NUM_SAMPLING_STEPS": num_sampling_steps,
         "MSA_MAX_DEPTH": args.msa_max_depth,
-        "ACTIVATION_CHECKPOINTING": args.activation_checkpointing
+        "ACTIVATION_CHECKPOINTING": args.activation_checkpointing,
+        "MODEL": args.model
     }
     if dc_names:
         run_params["DISTOGRAM_CONDITIONING"] = ":".join(dc_names)
@@ -562,7 +576,8 @@ def main():
         sys.exit(1)
 
     try:
-        model = ESMFold2Model.from_pretrained("biohub/ESMFold2").cuda().eval()
+        vprint(f"Loading local checkpoint {args.model}...")
+        model = ESMFold2Model.from_pretrained(args.model).cuda().eval()
 
         if args.activation_checkpointing:
             vprint("Applying activation checkpointing to TransformerBlock layers to optimize memory...")
