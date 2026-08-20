@@ -119,6 +119,62 @@ def csv_values(text, cast, name, allow_none=False):
     return values
 
 
+API_MAX_SEQUENCE_LENGTH = 768
+
+
+def local_command_recommendation(input_path, total_residues, args):
+    """Build a shell-safe recommendation for the companion local runner."""
+    import shlex
+    local_script = Path(__file__).with_name("run_esmfold2.py")
+    loops = min(args.num_loops, 10)
+    steps = min(args.num_sampling_steps, 68)
+    parts = [
+        "python", str(local_script), "-i", str(input_path),
+        "--model", "biohub/ESMFold2-Fast",
+        "--num-loops", str(loops),
+        "--num-sampling-steps", str(steps),
+        "--msa_max_depth", "1",
+        "--ensemble", "1", "--verbose",
+    ]
+    return " ".join(shlex.quote(x) for x in parts)
+
+
+def explain_api_length_limit(input_path, sequences, args):
+    total = sum(map(len, sequences.values()))
+    longest_id, longest_seq = max(sequences.items(), key=lambda kv: len(kv[1]))
+    if total <= API_MAX_SEQUENCE_LENGTH:
+        return False
+    eprint(
+        f"Error: Biohub API input length is {total} residues, exceeding its "
+        f"{API_MAX_SEQUENCE_LENGTH}-residue limit by {total - API_MAX_SEQUENCE_LENGTH}."
+    )
+    eprint(
+        "Changing --num-loops, --num-sampling-steps, dropout, masking, MSA depth, "
+        "or selecting esmfold2-fast does not change the API validation limit."
+    )
+    eprint(f"Longest input record: {longest_id} ({len(longest_seq)} residues).")
+    if len(sequences) == 1:
+        eprint(
+            "Options: (1) run the complete sequence locally; or (2) crop/split at a "
+            "biologically justified domain/linker boundary. Arbitrary overlapping chunks "
+            "will not preserve a reliable full-length inter-domain arrangement."
+        )
+    else:
+        eprint(
+            "Options: (1) run the complete complex locally; or (2) submit a biologically "
+            "justified subset whose combined length is <=768. Splitting chains removes "
+            "the omitted interfaces from the prediction."
+        )
+    eprint("Recommended companion local command (VRAM-conservative starting point):")
+    eprint("  " + local_command_recommendation(input_path, total, args))
+    eprint(
+        "If that is stable and more accuracy is required, increase in this order: "
+        "--num-loops 20, then --num-sampling-steps 100, then MSA depth. "
+        "Loops/steps affect compute and quality, not supported length; MSA depth increases memory."
+    )
+    return True
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -555,6 +611,8 @@ def main():
 
     sequences = read_fasta(input_path)
     complex_id = stem
+    if explain_api_length_limit(input_path, sequences, args):
+        raise SystemExit(2)
     msa_by_chain, msa_paths = parse_msa_specs(
         args.msa, list(sequences), args.msa_load_max_sequences
     )
@@ -645,6 +703,11 @@ def main():
                         f"  API returned ESMProteinError after {elapsed:.2f}s: "
                         f"{json.dumps(event['error'], sort_keys=True, default=repr)}"
                     )
+                    error_text = f"{candidate!s} {candidate!r}"
+                    if "exceeds maximum allowed sequence length" in error_text:
+                        eprint("  This is a non-retryable API input-length error.")
+                        explain_api_length_limit(input_path, sequences, args)
+                        break
                 elif not hasattr(candidate, "complex"):
                     last_error = TypeError(
                         f"Unexpected API result type {type(candidate).__module__}."
