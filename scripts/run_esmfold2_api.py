@@ -19,6 +19,7 @@ Install the current SDK with:
 
 import argparse
 import dataclasses
+import fcntl
 import csv
 import hashlib
 import json
@@ -218,7 +219,13 @@ def parse_args():
     p.add_argument("--no-pair-chains-iptm", action="store_true",
                    help="Do not request pair-chain iPTM (not recommended for complexes).")
     p.add_argument("--spread", type=int, default=0,
-                   help="Calls per key/bucket before rotating keys; 0 disables inter-bucket 24h spreading.")
+                   help="Calls per key/bucket before rotating keys; 0 uses 100-call buckets.")
+    p.add_argument(
+        "--min-submit-interval", type=float, default=4.0,
+        help=("Minimum seconds between fold_all_atom submissions for this model, "
+              "shared across concurrent local processes. Increase if the API "
+              "reports its rolling-minute token cap."),
+    )
     p.add_argument("--ignore-limit", action="store_true",
                    help="Disable local 20/min and 100/rolling-24h accounting.")
     p.add_argument("--max-retries", type=int, default=3)
@@ -235,6 +242,8 @@ def parse_args():
         p.error("--num-ensemble must be >= 1")
     if args.spread < 0:
         p.error("--spread must be >= 0")
+    if args.min_submit_interval < 0:
+        p.error("--min-submit-interval must be >= 0")
     if not 0 <= args.num_loops <= 20:
         p.error("--num-loops must be in [0, 20]")
     if not 1 <= args.num_sampling_steps <= 100:
@@ -468,18 +477,12 @@ def wait_needed(timestamps, now):
 
 
 def select_key_for_call(keys, files, call_index, selector, args):
-    """Select one key per API call, allowing an ensemble to span keys/days.
-
-    With ``--spread N``, each consecutive bucket of N planned poses prefers
-    one key before rotating. A full preferred key spills to another key with
-    rolling-24h capacity. If every key is full, wait for the earliest slot.
-    """
+    """Select one key per call, allowing ensembles to span keys and days."""
     offset = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
     bucket_size = args.spread if args.spread > 0 else MAX_CALLS_PER_24H
     preferred = (offset + call_index // bucket_size) % len(keys)
     if args.ignore_limit:
         return preferred, keys[preferred]
-
     while True:
         now = time.time()
         states = []
@@ -496,16 +499,13 @@ def select_key_for_call(keys, files, call_index, selector, args):
                 key=lambda state: (state[1] != 0, state[3], state[2], state[1]),
             )
             return idx, keys[idx]
-
         sleep_seconds, _, _ = min(
             (max(0.0, timestamps[0] + DAY_SECONDS + 0.05 - now), rank, idx)
             for _, rank, _, _, idx, timestamps in states
         )
         if args.verbose:
-            eprint(
-                "All API keys have reached the local rolling-24h limit; "
-                f"sleeping {sleep_seconds:.2f}s until one call slot is free"
-            )
+            eprint("All API keys are at the rolling-24h call limit; "
+                   f"sleeping {sleep_seconds:.2f}s")
         time.sleep(sleep_seconds)
 
 def reserve_call_on_key(key, rate_file, args):
@@ -524,6 +524,31 @@ def reserve_call_on_key(key, rate_file, args):
         timestamps.append(time.time())
         write_timestamps(rate_file, timestamps)
         return
+
+
+def pace_submission(model, minimum_interval, verbose=False):
+    """Serialize and pace submissions across concurrent local processes."""
+    if minimum_interval <= 0:
+        return
+    safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", model)
+    state_path = Path.home() / f".biohub.{safe_model}.last_submit"
+    with open(state_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        try:
+            last_submit = float(handle.read().strip())
+        except ValueError:
+            last_submit = 0.0
+        delay = max(0.0, minimum_interval - (time.time() - last_submit))
+        if delay > 0:
+            if verbose:
+                eprint(f"  Token-cap pacing: sleeping {delay:.2f}s")
+            time.sleep(delay)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{time.time():.6f}\n")
+        handle.flush()
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def make_config(args, item):
@@ -633,21 +658,17 @@ def main():
     rate_files = {key: get_rate_file(key) for key in api_keys}
     records = []
 
-    if not args.ignore_limit and args.verbose:
-        total_capacity = len(api_keys) * MAX_CALLS_PER_24H
-        eprint(
-            f"Local rolling-24h capacity: {total_capacity} calls across "
-            f"{len(api_keys)} key(s); large ensembles will span keys and, "
-            "when necessary, rolling-24h windows"
-        )
+    if args.verbose and not args.ignore_limit:
+        eprint(f"Local rolling-24h capacity: "
+               f"{len(api_keys) * MAX_CALLS_PER_24H} calls across {len(api_keys)} key(s)")
 
     for item in plan:
         sample = item["sample"]
         order = item["chain_order"]
         config = make_config(args, item)
         ensemble_key_idx, ensemble_key = select_key_for_call(
-            api_keys, rate_files, call_index=sample - 1,
-            selector=f"{complex_id}:{len(plan)}", args=args,
+            api_keys, rate_files, sample - 1,
+            f"{complex_id}:{len(plan)}", args,
         )
         ensemble_client = clients[ensemble_key]
         ensemble_rate_file = rate_files[ensemble_key]
@@ -669,7 +690,7 @@ def main():
         for attempt in range(args.max_retries + 1):
             attempt_started = time.monotonic()
             try:
-                # Every submission consumes quota, including retry attempts.
+                pace_submission(args.model, args.min_submit_interval, args.verbose)
                 reserve_call_on_key(ensemble_key, ensemble_rate_file, args)
                 if args.verbose:
                     eprint(f"  API attempt {attempt + 1}/{args.max_retries + 1}: submitting")
