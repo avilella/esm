@@ -233,6 +233,8 @@ def parse_args():
 
     if args.num_ensemble < 1:
         p.error("--num-ensemble must be >= 1")
+    if args.spread < 0:
+        p.error("--spread must be >= 0")
     if not 0 <= args.num_loops <= 20:
         p.error("--num-loops must be in [0, 20]")
     if not 1 <= args.num_sampling_steps <= 100:
@@ -465,48 +467,46 @@ def wait_needed(timestamps, now):
     return max([0.0] + waits)
 
 
-def select_key_for_ensemble(keys, files, calls_needed, selector, args):
-    """Select one API key for the complete pose ensemble."""
-    if calls_needed > MAX_CALLS_PER_24H and not args.ignore_limit:
-        raise ValueError(
-            f"A single ensemble requests {calls_needed} calls, but the local "
-            f"per-key rolling-24h limit is {MAX_CALLS_PER_24H}."
-        )
+def select_key_for_call(keys, files, call_index, selector, args):
+    """Select one key per API call, allowing an ensemble to span keys/days.
+
+    With ``--spread N``, each consecutive bucket of N planned poses prefers
+    one key before rotating. A full preferred key spills to another key with
+    rolling-24h capacity. If every key is full, wait for the earliest slot.
+    """
+    offset = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
+    bucket_size = args.spread if args.spread > 0 else MAX_CALLS_PER_24H
+    preferred = (offset + call_index // bucket_size) % len(keys)
     if args.ignore_limit:
-        idx = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
-        return idx, keys[idx]
+        return preferred, keys[preferred]
 
     while True:
         now = time.time()
         states = []
-        offset = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
         for rank in range(len(keys)):
-            idx = (offset + rank) % len(keys)
+            idx = (preferred + rank) % len(keys)
             timestamps = read_timestamps(files[keys[idx]], now)
-            remaining = MAX_CALLS_PER_24H - len(timestamps)
-            states.append((remaining >= calls_needed, len(timestamps), rank, idx, timestamps))
-
+            recent = sum(now - ts < MINUTE_SECONDS for ts in timestamps)
+            states.append((len(timestamps) < MAX_CALLS_PER_24H, rank, recent,
+                           len(timestamps), idx, timestamps))
         eligible = [state for state in states if state[0]]
         if eligible:
-            _, _, _, idx, _ = min(eligible, key=lambda state: (state[1], state[2]))
+            _, _, _, _, idx, _ = min(
+                eligible,
+                key=lambda state: (state[1] != 0, state[3], state[2], state[1]),
+            )
             return idx, keys[idx]
 
-        waits = []
-        for _, _, rank, idx, timestamps in states:
-            slots_to_free = calls_needed - (MAX_CALLS_PER_24H - len(timestamps))
-            if slots_to_free <= 0:
-                waits.append((0.0, rank, idx))
-            else:
-                expiry = timestamps[slots_to_free - 1] + DAY_SECONDS + 0.05
-                waits.append((max(0.0, expiry - now), rank, idx))
-        sleep_seconds, _, _ = min(waits)
+        sleep_seconds, _, _ = min(
+            (max(0.0, timestamps[0] + DAY_SECONDS + 0.05 - now), rank, idx)
+            for _, rank, _, _, idx, timestamps in states
+        )
         if args.verbose:
             eprint(
-                "No key can currently accommodate the complete "
-                f"{calls_needed}-pose ensemble; sleeping {sleep_seconds:.2f}s"
+                "All API keys have reached the local rolling-24h limit; "
+                f"sleeping {sleep_seconds:.2f}s until one call slot is free"
             )
         time.sleep(sleep_seconds)
-
 
 def reserve_call_on_key(key, rate_file, args):
     """Reserve one call on an already selected ensemble key."""
@@ -633,25 +633,24 @@ def main():
     rate_files = {key: get_rate_file(key) for key in api_keys}
     records = []
 
-    ensemble_key_idx, ensemble_key = select_key_for_ensemble(
-        api_keys,
-        rate_files,
-        calls_needed=len(plan),
-        selector=f"{complex_id}:{len(plan)}",
-        args=args,
-    )
-    ensemble_client = clients[ensemble_key]
-    ensemble_rate_file = rate_files[ensemble_key]
-    if args.verbose:
+    if not args.ignore_limit and args.verbose:
+        total_capacity = len(api_keys) * MAX_CALLS_PER_24H
         eprint(
-            f"Selected key={ensemble_key_idx + 1}/{len(api_keys)} for all "
-            f"{len(plan)} poses in complex {complex_id}"
+            f"Local rolling-24h capacity: {total_capacity} calls across "
+            f"{len(api_keys)} key(s); large ensembles will span keys and, "
+            "when necessary, rolling-24h windows"
         )
 
     for item in plan:
         sample = item["sample"]
         order = item["chain_order"]
         config = make_config(args, item)
+        ensemble_key_idx, ensemble_key = select_key_for_call(
+            api_keys, rate_files, call_index=sample - 1,
+            selector=f"{complex_id}:{len(plan)}", args=args,
+        )
+        ensemble_client = clients[ensemble_key]
+        ensemble_rate_file = rate_files[ensemble_key]
         protein_inputs = [
             input_builder.ProteinInput(id=chain, sequence=sequences[chain], msa=msa_by_chain.get(chain))
             for chain in order
@@ -664,14 +663,14 @@ def main():
                 f"msa_depth={item['msa_max_depth']} msa_col_mask={item['msa_column_mask_rate']}"
             )
 
-        reserve_call_on_key(ensemble_key, ensemble_rate_file, args)
-
         result = None
         last_error = None
         error_log_path = outdir / f"{stem}.{args.tag}.errors.jsonl"
         for attempt in range(args.max_retries + 1):
             attempt_started = time.monotonic()
             try:
+                # Every submission consumes quota, including retry attempts.
+                reserve_call_on_key(ensemble_key, ensemble_rate_file, args)
                 if args.verbose:
                     eprint(f"  API attempt {attempt + 1}/{args.max_retries + 1}: submitting")
                 candidate = ensemble_client.fold_all_atom(structure_input, config=config)
