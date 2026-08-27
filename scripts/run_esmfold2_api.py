@@ -10,6 +10,12 @@ Key features
 * PAE and pair-chain iPTM output, interface-PAE summaries, and a reproducible
   run-plan CSV written before API submission.
 * Multi-key rolling rate-limit accounting compatible with the original tool.
+* Quota-aware backoff: a 429 reporting the account's daily credit limit is not
+  retried seconds later. The reset time is taken from the server when it is
+  offered and otherwise estimated, recorded per token in
+  ~/biohub.api.<md5>.cooldown.json so concurrent runs share it, and the run
+  rotates to a token that still has allowance or sleeps until the reset.
+  See --on-credit-limit, --credit-reset-mode, and --test-availability.
 * Backward-compatible core options and stdout behaviour: stdout contains only
   the final summary CSV path.
 
@@ -18,12 +24,15 @@ Install the current SDK with:
 """
 
 import argparse
+import calendar
 import dataclasses
+import datetime
 import fcntl
 import csv
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -51,9 +60,261 @@ MAX_CALLS_PER_24H = 100
 MINUTE_SECONDS = 60.0
 DAY_SECONDS = 86400.0
 
+# A recorded quota denial is forgotten after this long, so an old exhaustion does
+# not keep escalating the backoff of an unrelated run days later.
+COOLDOWN_MEMORY_SECONDS = 2 * DAY_SECONDS
+
+# Substrings that identify a 429 as a *quota* exhaustion (resets on a daily
+# boundary) rather than a burst rate limit (resets within a minute).
+CREDIT_LIMIT_PATTERNS = (
+    "daily credit limit",
+    "credit limit",
+    "exceeded your daily",
+    "out of credits",
+    "insufficient credit",
+    "no credits remaining",
+    "daily limit",
+    "monthly limit",
+)
+RATE_LIMIT_PATTERNS = (
+    "rate limit",
+    "too many requests",
+    "requests per",
+    "per minute",
+    "per second",
+    "token cap",
+    "slow down",
+)
+# "quota" is used for both a daily allowance and a per-minute burst cap, so it
+# only decides the category when no rate-limit wording is present. Treating
+# "quota of 20 requests per minute" as a daily limit would sleep for hours.
+AMBIGUOUS_QUOTA_PATTERNS = ("quota",)
+
+# A daily allowance cannot legitimately reset more than a day out. A longer
+# hint means the field was misread -- a token expiry, or a duration parsed as
+# an epoch -- and trusting it would park a healthy token for months.
+MAX_PLAUSIBLE_RESET_SECONDS = DAY_SECONDS + 3600.0
+# A burst limit clears in seconds or minutes; never sleep on one for longer.
+MAX_RATE_LIMIT_WAIT_SECONDS = 3600.0
+LENGTH_LIMIT_PATTERNS = (
+    "exceeds maximum allowed sequence length",
+    "maximum allowed sequence length",
+)
+
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+
+def format_duration(seconds):
+    """Render a wait as a human-readable duration, e.g. '7h 12m 03s'."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
+
+
+def format_eta(epoch_seconds):
+    """Render an absolute resume time in both UTC and local time."""
+    utc = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch_seconds))
+    local = time.strftime("%H:%M:%S %Z", time.localtime(epoch_seconds))
+    return f"{utc} ({local} local)"
+
+
+def sleep_until(deadline_epoch, label, verbose, report_interval=900.0):
+    """Sleep until a wall-clock deadline, reporting progress on long waits.
+
+    Sleeping in bounded chunks keeps Ctrl-C responsive on every platform and
+    lets a multi-hour quota wait show that it is still alive.
+    """
+    remaining = deadline_epoch - time.time()
+    if remaining <= 0:
+        return
+    if verbose and remaining > report_interval:
+        eprint(f"  {label}: waiting {format_duration(remaining)}, resumes at {format_eta(deadline_epoch)}")
+    while True:
+        remaining = deadline_epoch - time.time()
+        if remaining <= 0:
+            return
+        nap = min(report_interval, remaining)
+        time.sleep(nap)
+        remaining = deadline_epoch - time.time()
+        if verbose and remaining > 1.0:
+            eprint(f"  {label}: {format_duration(remaining)} remaining "
+                   f"(resumes at {format_eta(deadline_epoch)})")
+
+
+@dataclasses.dataclass
+class ApiErrorInfo:
+    """Normalized view of an API failure, independent of SDK error shape."""
+    category: str  # credit_limit | rate_limit | length | transient | other
+    status: object = None
+    message: str = ""
+    retry_after: float = None  # seconds, only when the server said so
+    reset_at: float = None     # epoch, only when the server said so
+
+    @property
+    def server_hint(self):
+        return self.retry_after is not None or self.reset_at is not None
+
+
+def extract_json_body(text):
+    """Pull the JSON error body the SDK folds into its message string.
+
+    The SDK discards the HTTP response object (base_forge_client.prepare_data),
+    so the body text embedded in error_msg is the only structured detail left.
+    """
+    if not text:
+        return {}
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    body = text[start:end + 1]
+    for candidate in (body, body[:body.find("}") + 1]):
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def parse_epoch(value):
+    """Accept an epoch number or an ISO-8601 timestamp and return epoch seconds."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        # Values far in the past are almost certainly milliseconds.
+        return float(value) / 1000.0 if value > 1e11 else float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text) / 1000.0 if float(text) > 1e11 else float(text)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+RETRY_AFTER_KEYS = ("retry_after", "retryafter", "retry_after_seconds",
+                    "retry_in", "retry_in_seconds", "reset_in",
+                    "reset_in_seconds", "seconds_until_reset", "cooldown_seconds")
+RESET_AT_KEYS = ("reset_at", "resets_at", "reset_time", "resettime",
+                 "next_reset", "quota_reset", "quota_resets_at", "expires_at")
+
+_DURATION_RE = re.compile(
+    r"(?:retry[- _]?after|try again in|available again in|resets? in|wait)\D{0,12}?"
+    r"(\d+(?:\.\d+)?)\s*(millisecond|ms|second|sec|s|minute|min|m|hour|hr|h|day|d)s?\b",
+    re.IGNORECASE,
+)
+_UNIT_SECONDS = {"millisecond": 0.001, "ms": 0.001, "second": 1.0, "sec": 1.0,
+                 "s": 1.0, "minute": 60.0, "min": 60.0, "m": 60.0,
+                 "hour": 3600.0, "hr": 3600.0, "h": 3600.0,
+                 "day": DAY_SECONDS, "d": DAY_SECONDS}
+_RESET_AT_RE = re.compile(
+    r"(?:resets?|available again|try again)\s*(?:at|on)\s*"
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9:.+Z-]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_reset_hint(body, text):
+    """Return (retry_after_seconds, reset_at_epoch) if the server supplied either."""
+    retry_after = reset_at = None
+    flat = {}
+
+    def flatten(node, depth=0):
+        if depth > 3 or not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            if isinstance(value, dict):
+                flatten(value, depth + 1)
+            else:
+                flat.setdefault(normalized, value)
+
+    flatten(body)
+    for key in RETRY_AFTER_KEYS:
+        if key in flat:
+            try:
+                candidate = float(flat[key])
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                retry_after = candidate
+                break
+    for key in RESET_AT_KEYS:
+        if key in flat:
+            candidate = parse_epoch(flat[key])
+            if candidate:
+                reset_at = candidate
+                break
+    if retry_after is None:
+        match = _DURATION_RE.search(text or "")
+        if match:
+            retry_after = float(match.group(1)) * _UNIT_SECONDS[match.group(2).lower()]
+    if reset_at is None:
+        match = _RESET_AT_RE.search(text or "")
+        if match:
+            reset_at = parse_epoch(match.group(1))
+    return retry_after, reset_at
+
+
+def classify_api_error(error):
+    """Classify an API failure so the caller can pick the right wait strategy."""
+    text = f"{error!s} {error!r}"
+    body = extract_json_body(str(getattr(error, "error_msg", "")) or text)
+    message = str(body.get("message") or body.get("detail") or body.get("error") or "").strip()
+    haystack = f"{text} {message}".lower()
+    status = getattr(error, "error_code", None)
+    if status is None:
+        status = body.get("status_code") or body.get("code")
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = None
+    retry_after, reset_at = parse_reset_hint(body, f"{text} {message}")
+
+    if any(pattern in haystack for pattern in LENGTH_LIMIT_PATTERNS):
+        category = "length"
+    # Only guess from the text when the status is genuinely unknown: an error
+    # body routinely carries a stray "429" in a request id or millisecond
+    # epoch, which must not override a known 500.
+    elif status == 429 or (status is None and "429" in haystack):
+        if any(pattern in haystack for pattern in CREDIT_LIMIT_PATTERNS):
+            category = "credit_limit"
+        elif any(pattern in haystack for pattern in RATE_LIMIT_PATTERNS):
+            category = "rate_limit"
+        elif any(pattern in haystack for pattern in AMBIGUOUS_QUOTA_PATTERNS):
+            category = "credit_limit"
+        else:
+            # An unlabelled 429 is treated as a burst limit: the minute-scale
+            # wait is cheap, and a repeat denial escalates it anyway.
+            category = "rate_limit"
+    elif status in (500, 502, 503, 504):
+        category = "transient"
+    elif status in (401, 403):
+        category = "auth"
+    else:
+        category = "other"
+    return ApiErrorInfo(category=category, status=status,
+                        message=message or str(error), retry_after=retry_after,
+                        reset_at=reset_at)
 
 
 def diagnostic_payload(value):
@@ -227,9 +488,51 @@ def parse_args():
               "reports its rolling-minute token cap."),
     )
     p.add_argument("--ignore-limit", action="store_true",
-                   help="Disable local 20/min and 100/rolling-24h accounting.")
-    p.add_argument("--max-retries", type=int, default=3)
-    p.add_argument("--retry-base-seconds", type=float, default=15.0)
+                   help="Disable local 20/min and 100/rolling-24h accounting. Quota denials "
+                        "actually reported by the API are still honoured.")
+    p.add_argument("--max-retries", type=int, default=3,
+                   help="Retries for transient failures. Quota denials do not consume this budget.")
+    p.add_argument("--retry-base-seconds", type=float, default=15.0,
+                   help="Base backoff for transient failures only.")
+    p.add_argument(
+        "--on-credit-limit", choices=("wait", "skip", "abort"), default="wait",
+        help=("Action when the API reports the account's credit/quota is exhausted. "
+              "'wait' sleeps until the computed reset, 'skip' abandons the remaining "
+              "poses on that token, 'abort' exits immediately reporting the reset time."),
+    )
+    p.add_argument(
+        "--credit-reset-mode", choices=("auto", "rolling", "utc-midnight"), default="auto",
+        help=("How the daily quota is assumed to reset when the API gives no hint. "
+              "'rolling' waits for the oldest recorded call to age out of 24h, "
+              "'utc-midnight' waits for the next --credit-reset-utc-hour boundary, "
+              "'auto' takes whichever comes first."),
+    )
+    p.add_argument("--credit-reset-utc-hour", type=int, default=0,
+                   help="UTC hour at which the daily credit allowance resets.")
+    p.add_argument(
+        "--max-credit-wait-seconds", type=float, default=90000.0,
+        help=("Refuse to wait longer than this for a quota reset; a longer estimate "
+              "means the quota model is wrong and the pose is skipped instead."),
+    )
+    p.add_argument(
+        "--min-credit-probe-interval", type=float, default=900.0,
+        help=("Shortest gap between probe calls on a quota-exhausted token when the "
+              "API supplies no reset time. Doubles on each consecutive denial."),
+    )
+    p.add_argument("--max-credit-waits", type=int, default=4,
+                   help="Quota-reset waits allowed per pose before it is abandoned.")
+    p.add_argument(
+        "--clear-credit-cooldown", action="store_true",
+        help=("Forget every recorded quota denial for the supplied tokens and start "
+              "fresh. Use when a token is held back by a stale or wrong reset time."),
+    )
+    p.add_argument(
+        "--sdk-retry-attempts", type=int, default=1,
+        help=("Attempts the ESM SDK makes internally before returning an error. The "
+              "SDK retries every 429 a second apart, which burns requests against a "
+              "quota that will not reset for hours; 1 disables it so this script's "
+              "own reset-aware backoff decides."),
+    )
     p.add_argument("--ranking-iptm-weight", type=float, default=0.55)
     p.add_argument("--ranking-ptm-weight", type=float, default=0.25)
     p.add_argument("--ranking-plddt-weight", type=float, default=0.20)
@@ -252,6 +555,16 @@ def parse_args():
         p.error("--max-chain-orders must be >= 1")
     if args.msa_load_max_sequences < 1 or args.msa_load_max_sequences > 16384:
         p.error("--msa-load-max-sequences must be in [1, 16384]")
+    if not 0 <= args.credit_reset_utc_hour <= 23:
+        p.error("--credit-reset-utc-hour must be in [0, 23]")
+    if args.min_credit_probe_interval < 1:
+        p.error("--min-credit-probe-interval must be >= 1")
+    if args.max_credit_wait_seconds < args.min_credit_probe_interval:
+        p.error("--max-credit-wait-seconds must be >= --min-credit-probe-interval")
+    if args.max_credit_waits < 0:
+        p.error("--max-credit-waits must be >= 0")
+    if args.sdk_retry_attempts < 1:
+        p.error("--sdk-retry-attempts must be >= 1")
 
     args.lm_dropouts = csv_values(args.lm_dropouts, float, "--lm-dropouts")
     args.lm_mask_pcts = csv_values(args.lm_mask_pcts, float, "--lm-mask-pcts", allow_none=True)
@@ -463,7 +776,181 @@ def read_timestamps(path, now):
 
 
 def write_timestamps(path, timestamps):
-    path.write_text("".join(f"{x:.6f}\n" for x in sorted(timestamps)), encoding="utf-8")
+    """Replace the ledger atomically so a concurrent reader never sees it torn."""
+    payload = "".join(f"{x:.6f}\n" for x in sorted(timestamps))
+    temp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        temp.write_text(payload, encoding="utf-8")
+        os.replace(temp, path)
+    except OSError:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        path.write_text(payload, encoding="utf-8")
+
+
+def get_cooldown_file(key):
+    """Sidecar recording a server-observed quota denial for one token."""
+    md5_hash = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return Path.home() / f"biohub.api.{md5_hash}.cooldown.json"
+
+
+def read_cooldown(path, now):
+    """Return (until_epoch, denials, reason) for a token's recorded quota denial.
+
+    `until_epoch` is 0.0 when the token is not currently cooling down. Denials
+    are retained past expiry so a reset estimate that proves too optimistic
+    escalates the next wait instead of re-probing at the same cadence.
+    """
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return 0.0, 0, ""
+    if not isinstance(state, dict):
+        return 0.0, 0, ""
+    try:
+        until = float(state.get("until") or 0.0)
+    except (TypeError, ValueError):
+        until = 0.0
+    try:
+        denials = int(state.get("denials") or 0)
+    except (TypeError, ValueError):
+        denials = 0
+    try:
+        observed_at = float(state.get("observed_at") or 0.0)
+    except (TypeError, ValueError):
+        observed_at = 0.0
+    if observed_at and now - observed_at > COOLDOWN_MEMORY_SECONDS:
+        return 0.0, 0, ""
+    reason = str(state.get("reason") or "")
+    return (until if until > now else 0.0), denials, reason
+
+
+def write_cooldown(path, state):
+    """Atomically replace the cooldown sidecar so concurrent readers never see a partial file."""
+    temp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        temp.write_text(json.dumps(state, sort_keys=True, default=repr) + "\n", encoding="utf-8")
+        os.replace(temp, path)
+    except OSError:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
+def clear_cooldown(key):
+    """Forget a token's quota denial after a call on it succeeds."""
+    path = get_cooldown_file(key)
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def next_daily_reset(now, utc_hour):
+    """Next occurrence of utc_hour:00:00 UTC strictly after `now`."""
+    parts = time.gmtime(now)
+    boundary = calendar.timegm(
+        (parts.tm_year, parts.tm_mon, parts.tm_mday, int(utc_hour), 0, 0, 0, 0, 0)
+    )
+    return boundary if boundary > now else boundary + DAY_SECONDS
+
+
+def estimate_credit_reset(info, rate_file, now, args, denials):
+    """Estimate when a quota-exhausted token can be used again.
+
+    Preference order: an explicit server hint, then the earliest reset that
+    either plausible quota model allows. Under a rolling 24h window the first
+    credit frees when our oldest recorded call ages out; under a calendar-day
+    window it frees at the configured UTC hour. `auto` takes whichever comes
+    first and probes there, because probing early costs one rejected request
+    while probing late wastes hours.
+    """
+    # Escalate only once a previous estimate has been proved wrong by a repeat
+    # denial, and never probe less often than once per reset cycle.
+    repeat_floor = (args.min_credit_probe_interval * (2 ** (denials - 2))
+                    if denials >= 2 else 0.0)
+    repeat_floor = min(repeat_floor, DAY_SECONDS)
+
+    hint, basis = None, None
+    if info.reset_at:
+        hint, basis = info.reset_at - now, "server-provided reset time"
+    elif info.retry_after:
+        hint, basis = info.retry_after, "server-provided retry-after"
+    if hint is not None:
+        if 0 < hint <= MAX_PLAUSIBLE_RESET_SECONDS:
+            if hint < repeat_floor:
+                return now + repeat_floor, (
+                    f"{basis} of {format_duration(hint)}, extended to "
+                    f"{format_duration(repeat_floor)} after {denials} denials")
+            return now + hint, basis
+        eprint(f"  Ignoring an implausible {basis} of {format_duration(abs(hint))}; "
+               f"estimating the reset instead.")
+
+    candidates = []
+    if args.credit_reset_mode in ("auto", "rolling"):
+        timestamps = read_timestamps(rate_file, now)
+        if timestamps:
+            candidates.append((timestamps[0] + DAY_SECONDS, "rolling 24h window"))
+    if args.credit_reset_mode in ("auto", "utc-midnight") or not candidates:
+        candidates.append((next_daily_reset(now, args.credit_reset_utc_hour),
+                           f"{args.credit_reset_utc_hour:02d}:00 UTC daily reset"))
+    reset_at, basis = min(candidates)
+
+    # No server hint means the estimate is a guess; never re-probe faster than
+    # the probe floor, and double it for each consecutive denial. The floor is
+    # capped at one reset cycle so it can lengthen a too-optimistic estimate
+    # without pushing the wait past the reset it is waiting for.
+    floor = min(args.min_credit_probe_interval * (2 ** max(0, denials - 1)), DAY_SECONDS)
+    if reset_at - now < floor:
+        reset_at = now + floor
+        basis = f"{basis}, floored to the {format_duration(floor)} probe interval"
+    return reset_at, basis
+
+
+def record_credit_denial(key, info, rate_file, args, now=None):
+    """Persist a quota denial and return (resume_epoch, denials, basis)."""
+    now = time.time() if now is None else now
+    path = get_cooldown_file(key)
+    previous_until, denials, _ = read_cooldown(path, now)
+    denials += 1
+    reset_at, basis = estimate_credit_reset(info, rate_file, now, args, denials)
+    # Never shorten a cooldown another process already recorded.
+    reset_at = max(reset_at, previous_until)
+    write_cooldown(path, {
+        "until": reset_at,
+        "observed_at": now,
+        "denials": denials,
+        "reason": info.message or "quota exhausted",
+        "basis": basis,
+        "status": info.status,
+        "alias": key_alias(key),
+    })
+    return reset_at, denials, basis
+
+
+def rate_limit_backoff(info, rate_file, now, args, attempt):
+    """Seconds to wait after a burst-rate 429: until the minute window frees.
+
+    Always bounded: a burst limit clears in seconds or minutes, so a server
+    hint of hours is a misread field rather than an instruction to go silent.
+    """
+    hint = None
+    if info is not None and info.reset_at:
+        hint = info.reset_at - now
+    elif info is not None and info.retry_after:
+        hint = info.retry_after
+    if hint is not None and 0 < hint <= MAX_RATE_LIMIT_WAIT_SECONDS:
+        return hint
+    timestamps = read_timestamps(rate_file, now)
+    recent = [x for x in timestamps if now - x < MINUTE_SECONDS]
+    wait = MINUTE_SECONDS - (now - recent[0]) + 1.0 if recent else MINUTE_SECONDS
+    # Respect the submission pacer's floor and grow slightly on repeat denials.
+    wait = max(wait, args.min_submit_interval, 5.0) * (1.5 ** attempt)
+    return min(wait, MAX_RATE_LIMIT_WAIT_SECONDS)
 
 
 def wait_needed(timestamps, now):
@@ -476,54 +963,112 @@ def wait_needed(timestamps, now):
     return max([0.0] + waits)
 
 
-def select_key_for_call(keys, files, call_index, selector, args):
-    """Select one key per call, allowing ensembles to span keys and days."""
+def select_key_for_call(keys, files, call_index, selector, args, blocking=True):
+    """Select one key per call, allowing ensembles to span keys and days.
+
+    A token is skipped when local accounting says it is spent *or* when the API
+    itself reported its quota exhausted and the recorded reset has not passed.
+    With `blocking=False` the caller gets (None, None, resume_epoch) instead of
+    a sleep, so it can decide whether waiting is worthwhile.
+    """
     offset = int(hashlib.sha256(selector.encode()).hexdigest(), 16) % len(keys)
     bucket_size = args.spread if args.spread > 0 else MAX_CALLS_PER_24H
     preferred = (offset + call_index // bucket_size) % len(keys)
-    if args.ignore_limit:
-        return preferred, keys[preferred]
     while True:
         now = time.time()
         states = []
         for rank in range(len(keys)):
             idx = (preferred + rank) % len(keys)
-            timestamps = read_timestamps(files[keys[idx]], now)
+            key = keys[idx]
+            cooldown_until, _, _ = read_cooldown(get_cooldown_file(key), now)
+            if args.ignore_limit:
+                timestamps, local_free_at = [], 0.0
+            else:
+                timestamps = read_timestamps(files[key], now)
+                local_free_at = (timestamps[-MAX_CALLS_PER_24H] + DAY_SECONDS + 0.05
+                                 if len(timestamps) >= MAX_CALLS_PER_24H else 0.0)
+            ready_at = max(cooldown_until, local_free_at)
             recent = sum(now - ts < MINUTE_SECONDS for ts in timestamps)
-            states.append((len(timestamps) < MAX_CALLS_PER_24H, rank, recent,
-                           len(timestamps), idx, timestamps))
+            states.append((ready_at <= now, rank, recent, len(timestamps), idx, ready_at))
         eligible = [state for state in states if state[0]]
         if eligible:
             _, _, _, _, idx, _ = min(
                 eligible,
                 key=lambda state: (state[1] != 0, state[3], state[2], state[1]),
             )
-            return idx, keys[idx]
-        sleep_seconds, _, _ = min(
-            (max(0.0, timestamps[0] + DAY_SECONDS + 0.05 - now), rank, idx)
-            for _, rank, _, _, idx, timestamps in states
-        )
+            return idx, keys[idx], 0.0
+        resume_at, _, _ = min((ready_at, rank, idx)
+                              for _, rank, _, _, idx, ready_at in states)
+        if not blocking:
+            return None, None, resume_at
         if args.verbose:
-            eprint("All API keys are at the rolling-24h call limit; "
-                   f"sleeping {sleep_seconds:.2f}s")
-        time.sleep(sleep_seconds)
+            eprint(f"All {len(keys)} API token(s) are out of allowance; "
+                   f"waiting {format_duration(resume_at - now)} until {format_eta(resume_at)}")
+        sleep_until(resume_at, "Token allowance wait", args.verbose)
 
 def reserve_call_on_key(key, rate_file, args):
-    """Reserve one call on an already selected ensemble key."""
+    """Reserve one call on an already selected ensemble key.
+
+    Returns the reserved timestamp so a request the API rejects without doing
+    any work can hand the reservation back.
+    """
     if args.ignore_limit:
-        return
+        return None
     while True:
         now = time.time()
         timestamps = read_timestamps(rate_file, now)
         wait = wait_needed(timestamps, now)
         if wait > 0:
+            resume_at = now + wait
             if args.verbose:
-                eprint(f"Selected ensemble key is locally limited; sleeping {wait:.2f}s")
-            time.sleep(wait)
+                eprint(f"Selected ensemble key is locally limited; waiting "
+                       f"{format_duration(wait)} until {format_eta(resume_at)}")
+            sleep_until(resume_at, "Local rate-limit wait", args.verbose)
             continue
-        timestamps.append(time.time())
+        reserved = time.time()
+        timestamps.append(reserved)
         write_timestamps(rate_file, timestamps)
+        return reserved
+
+
+def release_call_on_key(rate_file, reserved, args):
+    """Return a reservation the API rejected before performing any inference.
+
+    A 429 is refused at the gate, so counting it locally would shrink the day's
+    real allowance every time the quota is probed.
+    """
+    if args.ignore_limit or reserved is None:
         return
+    now = time.time()
+    timestamps = read_timestamps(rate_file, now)
+    if not timestamps:
+        return
+    # The ledger round-trips through "%.6f", so the stored value is only close
+    # to the reserved one. Drop the nearest entry: the timestamps are
+    # interchangeable counters, so releasing any adjacent one is equivalent.
+    index = min(range(len(timestamps)), key=lambda i: abs(timestamps[i] - reserved))
+    if abs(timestamps[index] - reserved) > 1.0:
+        return
+    del timestamps[index]
+    write_timestamps(rate_file, timestamps)
+
+
+def configure_client_retries(client, attempts):
+    """Cap the SDK's internal retry loop.
+
+    esm.sdk.retry retries every 429 one second apart, so a single submission
+    against an exhausted daily quota becomes several rejected requests before
+    the error is ever visible here.
+    """
+    applied = False
+    for name in ("max_retry_attempts", "max_retries"):
+        if hasattr(client, name):
+            try:
+                setattr(client, name, attempts)
+                applied = True
+            except (AttributeError, TypeError):
+                continue
+    return applied
 
 
 def pace_submission(model, minimum_interval, verbose=False):
@@ -587,39 +1132,61 @@ def write_plan(path, plan, args, msa_paths):
 
 def main():
     args = parse_args()
-    
+
+    if args.clear_credit_cooldown:
+        for key in parse_api_keys(args.api_token):
+            path = get_cooldown_file(key)
+            if path.exists():
+                eprint(f"Cleared the recorded quota denial for token {key_alias(key)}.")
+            clear_cooldown(key)
+
     # Handle the --test-availability early exit flag
     if args.test_availability:
         api_keys = parse_api_keys(args.api_token)
             
         now = time.time()
-        print(f"{'Token Alias':<15} | {'1-Min Capacity':<16} | {'24-Hour Capacity':<18} | {'Rate File'}")
-        print("-" * 80)
-        
+        print(f"{'Token Alias':<15} | {'1-Min Capacity':<16} | {'24-Hour Capacity':<18} | {'API Quota Status'}")
+        print("-" * 96)
+
         total_min_avail = 0
         total_min_max = 0
         total_day_avail = 0
         total_day_max = 0
-        
+        blocked = []
+
         for key in api_keys:
             alias = key_alias(key)
             rate_file = get_rate_file(key)
-            
+
             timestamps = read_timestamps(rate_file, now)
             recent = [x for x in timestamps if now - x < MINUTE_SECONDS]
-            
+
             min_avail = max(0, MAX_CALLS_PER_MINUTE - len(recent))
             day_avail = max(0, MAX_CALLS_PER_24H - len(timestamps))
-            
+
             total_min_avail += min_avail
             total_min_max += MAX_CALLS_PER_MINUTE
             total_day_avail += day_avail
             total_day_max += MAX_CALLS_PER_24H
-            
-            print(f"{alias:<15} | {min_avail:>2} / {MAX_CALLS_PER_MINUTE:<11} | {day_avail:>3} / {MAX_CALLS_PER_24H:<12} | {rate_file.name}")
-        
-        print("-" * 80)
-        print(f"{'TOTAL':<15} | {total_min_avail:>2} / {total_min_max:<11} | {total_day_avail:>3} / {total_day_max:<12} |")
+
+            # Local counters only track what this machine spent; a denial the API
+            # itself reported is the authoritative signal.
+            until, denials, reason = read_cooldown(get_cooldown_file(key), now)
+            if until:
+                status = (f"BLOCKED {format_duration(until - now)} "
+                          f"(until {time.strftime('%H:%M:%S UTC', time.gmtime(until))}, "
+                          f"denial #{denials})")
+                blocked.append((until, alias, reason))
+            else:
+                status = "available"
+
+            print(f"{alias:<15} | {min_avail:>2} / {MAX_CALLS_PER_MINUTE:<11} | {day_avail:>3} / {MAX_CALLS_PER_24H:<12} | {status}")
+
+        print("-" * 96)
+        print(f"{'TOTAL':<15} | {total_min_avail:>2} / {total_min_max:<11} | {total_day_avail:>3} / {total_day_max:<12} | "
+              f"{len(api_keys) - len(blocked)} of {len(api_keys)} token(s) usable now")
+        for until, alias, reason in sorted(blocked):
+            print(f"  {alias}: API reported {reason or 'quota exhausted'}; next attempt at {format_eta(until)}")
         return
 
     input_path = Path(args.inputfile).expanduser().resolve()
@@ -653,25 +1220,35 @@ def main():
 
     api_keys = parse_api_keys(args.api_token)
     clients = {key: esmfold2_client(model=args.model, token=key) for key in api_keys}
-    
+    for api_client in clients.values():
+        configure_client_retries(api_client, args.sdk_retry_attempts)
+
     # Store and map local limits accurately to $HOME with the biohub.api.<md5>.txt format
     rate_files = {key: get_rate_file(key) for key in api_keys}
     records = []
+    aborted = False
+    # A quota denial does not consume the transient-failure budget, so bound the
+    # total number of refusals a single pose may provoke across all tokens.
+    max_quota_denials = args.max_credit_waits + len(api_keys)
+    # A reset the account never honours would otherwise make every remaining pose
+    # repeat the full wait, so stop once several poses in a row get nothing.
+    consecutive_allowance_skips = 0
+    MAX_CONSECUTIVE_ALLOWANCE_SKIPS = 3
 
     if args.verbose and not args.ignore_limit:
         eprint(f"Local rolling-24h capacity: "
                f"{len(api_keys) * MAX_CALLS_PER_24H} calls across {len(api_keys)} key(s)")
+    if args.verbose:
+        for index, key in enumerate(api_keys):
+            until, denials, reason = read_cooldown(get_cooldown_file(key), time.time())
+            if until:
+                eprint(f"Token {index + 1}/{len(api_keys)} ({key_alias(key)}) is quota-limited "
+                       f"until {format_eta(until)} after {denials} denial(s): {reason}")
 
     for item in plan:
         sample = item["sample"]
         order = item["chain_order"]
         config = make_config(args, item)
-        ensemble_key_idx, ensemble_key = select_key_for_call(
-            api_keys, rate_files, sample - 1,
-            f"{complex_id}:{len(plan)}", args,
-        )
-        ensemble_client = clients[ensemble_key]
-        ensemble_rate_file = rate_files[ensemble_key]
         protein_inputs = [
             input_builder.ProteinInput(id=chain, sequence=sequences[chain], msa=msa_by_chain.get(chain))
             for chain in order
@@ -679,35 +1256,86 @@ def main():
         structure_input = input_builder.StructurePredictionInput(sequences=protein_inputs)
         if args.verbose:
             eprint(
-                f"[{sample}/{len(plan)}] key={ensemble_key_idx + 1}/{len(api_keys)} order={':'.join(order)} "
+                f"[{sample}/{len(plan)}] order={':'.join(order)} "
                 f"dropout={item['lm_dropout']} mask={item['lm_mask_pct']} "
                 f"msa_depth={item['msa_max_depth']} msa_col_mask={item['msa_column_mask_rate']}"
             )
 
         result = None
         last_error = None
+        attempt = 0          # transient failures spent, bounded by --max-retries
+        credit_waits = 0     # quota-reset sleeps spent, bounded by --max-credit-waits
+        quota_denials = 0
+        submissions = 0
+        ensemble_key = None
+        allowance_blocked = False  # pose gave up because there was no allowance
         error_log_path = outdir / f"{stem}.{args.tag}.errors.jsonl"
-        for attempt in range(args.max_retries + 1):
+
+        while True:
+            ensemble_key_idx, ensemble_key, resume_at = select_key_for_call(
+                api_keys, rate_files, sample - 1,
+                f"{complex_id}:{len(plan)}", args, blocking=False,
+            )
+            if ensemble_key is None:
+                # Every token is spent, either by local accounting or by a quota
+                # denial the API itself reported. Wait for the earliest reset
+                # instead of re-submitting into a refusal.
+                wait = max(0.0, resume_at - time.time())
+                summary = (f"all {len(api_keys)} token(s) out of allowance until "
+                           f"{format_eta(resume_at)} ({format_duration(wait)})")
+                if args.on_credit_limit == "abort":
+                    eprint(f"Error: {summary}; aborting as requested by --on-credit-limit abort.")
+                    aborted = True
+                    break
+                if args.on_credit_limit == "skip":
+                    # An explicit skip is the requested outcome, not a stall, so
+                    # it must not feed the give-up counter.
+                    eprint(f"Skipping sample {sample}: {summary} (--on-credit-limit skip).")
+                    break
+                allowance_blocked = True
+                if wait > args.max_credit_wait_seconds:
+                    eprint(f"Skipping sample {sample}: {summary} exceeds "
+                           f"--max-credit-wait-seconds ({format_duration(args.max_credit_wait_seconds)}).")
+                    break
+                if credit_waits >= args.max_credit_waits:
+                    eprint(f"Skipping sample {sample}: {summary}, and --max-credit-waits "
+                           f"({args.max_credit_waits}) is exhausted.")
+                    break
+                allowance_blocked = False
+                credit_waits += 1
+                eprint(f"  Allowance exhausted; {summary}. Waiting "
+                       f"({credit_waits}/{args.max_credit_waits}).")
+                sleep_until(resume_at, "Allowance wait", args.verbose)
+                continue
+
+            ensemble_client = clients[ensemble_key]
+            ensemble_rate_file = rate_files[ensemble_key]
+            failure = None
+            reserved = None
             attempt_started = time.monotonic()
             try:
                 pace_submission(args.model, args.min_submit_interval, args.verbose)
-                reserve_call_on_key(ensemble_key, ensemble_rate_file, args)
+                reserved = reserve_call_on_key(ensemble_key, ensemble_rate_file, args)
+                submissions += 1
                 if args.verbose:
-                    eprint(f"  API attempt {attempt + 1}/{args.max_retries + 1}: submitting")
+                    eprint(f"  Submission {submissions} on token {ensemble_key_idx + 1}/{len(api_keys)} "
+                           f"({key_alias(ensemble_key)}); retry {attempt}/{args.max_retries}")
                 candidate = ensemble_client.fold_all_atom(structure_input, config=config)
                 elapsed = time.monotonic() - attempt_started
                 if isinstance(candidate, ESMProteinError):
                     last_error = candidate
+                    failure = classify_api_error(candidate)
                     event = {
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "complex_id": complex_id,
                         "sample": sample,
-                        "attempt": attempt + 1,
+                        "attempt": submissions,
                         "elapsed_seconds": round(elapsed, 3),
                         "api_key_alias": key_alias(ensemble_key),
                         "model": args.model,
                         "input_residues": sum(len(sequences[c]) for c in order),
                         "chain_order": list(order),
+                        "error_category": failure.category,
                         "config": {
                             "num_loops": args.num_loops,
                             "num_sampling_steps": args.num_sampling_steps,
@@ -720,22 +1348,18 @@ def main():
                     }
                     append_jsonl(error_log_path, event)
                     eprint(
-                        f"  API returned ESMProteinError after {elapsed:.2f}s: "
+                        f"  API returned ESMProteinError ({failure.category}) after {elapsed:.2f}s: "
                         f"{json.dumps(event['error'], sort_keys=True, default=repr)}"
                     )
-                    error_text = f"{candidate!s} {candidate!r}"
-                    if "exceeds maximum allowed sequence length" in error_text:
-                        eprint("  This is a non-retryable API input-length error.")
-                        explain_api_length_limit(input_path, sequences, args)
-                        break
                 elif not hasattr(candidate, "complex"):
                     last_error = TypeError(
                         f"Unexpected API result type {type(candidate).__module__}."
                         f"{type(candidate).__qualname__}; missing 'complex'"
                     )
+                    failure = ApiErrorInfo(category="other", message=str(last_error))
                     event = {
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "complex_id": complex_id, "sample": sample, "attempt": attempt + 1,
+                        "complex_id": complex_id, "sample": sample, "attempt": submissions,
                         "elapsed_seconds": round(elapsed, 3),
                         "api_key_alias": key_alias(ensemble_key),
                         "result": diagnostic_payload(candidate),
@@ -744,34 +1368,106 @@ def main():
                     eprint(f"  {last_error}: {json.dumps(event['result'], sort_keys=True, default=repr)}")
                 else:
                     result = candidate
+                    clear_cooldown(ensemble_key)
                     if args.verbose:
-                        eprint(f"  API attempt {attempt + 1} succeeded in {elapsed:.2f}s")
+                        eprint(f"  Submission {submissions} succeeded in {elapsed:.2f}s")
                     break
             except Exception as exc:
                 elapsed = time.monotonic() - attempt_started
                 last_error = exc
+                failure = (classify_api_error(exc) if isinstance(exc, ESMProteinError)
+                           else ApiErrorInfo(category="other", message=str(exc)))
                 event = {
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "complex_id": complex_id, "sample": sample, "attempt": attempt + 1,
+                    "complex_id": complex_id, "sample": sample, "attempt": submissions,
                     "elapsed_seconds": round(elapsed, 3),
                     "api_key_alias": key_alias(ensemble_key),
+                    "error_category": failure.category,
                     "exception": diagnostic_payload(exc),
                     "traceback": traceback.format_exc(),
                 }
                 append_jsonl(error_log_path, event)
-                eprint(f"  API attempt {attempt + 1} raised {type(exc).__name__}: {exc}")
+                eprint(f"  Submission {submissions} raised {type(exc).__name__} "
+                       f"({failure.category}): {exc}")
                 if args.verbose:
                     eprint(event["traceback"].rstrip())
-            if attempt < args.max_retries:
+
+            if failure.category == "length":
+                eprint("  This is a non-retryable API input-length error.")
+                explain_api_length_limit(input_path, sequences, args)
+                break
+            if failure.category == "auth":
+                eprint("  The API rejected this token; retrying cannot help.")
+                break
+            if failure.category in ("credit_limit", "rate_limit"):
+                # Refused at the gate, so no inference ran: give the local
+                # allowance its reservation back.
+                release_call_on_key(ensemble_rate_file, reserved, args)
+
+            if failure.category == "credit_limit":
+                quota_denials += 1
+                resume_at, denials, basis = record_credit_denial(
+                    ensemble_key, failure, ensemble_rate_file, args
+                )
+                append_jsonl(error_log_path, {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "complex_id": complex_id, "sample": sample,
+                    "stage": "credit_limit_backoff",
+                    "api_key_alias": key_alias(ensemble_key),
+                    "resume_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(resume_at)),
+                    "wait_seconds": round(max(0.0, resume_at - time.time()), 3),
+                    "basis": basis, "denial": denials,
+                    "server_supplied_reset": failure.server_hint,
+                })
+                eprint(f"  Token {ensemble_key_idx + 1}/{len(api_keys)} ({key_alias(ensemble_key)}) "
+                       f"is out of credits: {failure.message or 'quota exhausted'}")
+                eprint(f"  No further calls on it before {format_eta(resume_at)} "
+                       f"(in {format_duration(resume_at - time.time())}; "
+                       f"basis: {basis}; denial #{denials}).")
+                if quota_denials > max_quota_denials:
+                    eprint(f"Skipping sample {sample}: {quota_denials} quota denials across "
+                           f"{len(api_keys)} token(s); the account has no allowance to give.")
+                    allowance_blocked = True
+                    break
+                # Re-select: another token may still have allowance, and if none
+                # does the branch above computes the wait once, in one place.
+                continue
+
+            if attempt >= args.max_retries:
+                break
+            if failure.category == "rate_limit":
+                delay = rate_limit_backoff(failure, ensemble_rate_file, time.time(), args, attempt)
+                reason = "burst rate limit"
+            else:
                 delay = args.retry_base_seconds * (2 ** attempt) * random.uniform(0.8, 1.2)
-                eprint(f"  Retrying after {delay:.2f}s; diagnostics: {error_log_path}")
-                time.sleep(delay)
+                reason = failure.category
+            attempt += 1
+            eprint(f"  Retrying after {format_duration(delay)} ({reason}); "
+                   f"diagnostics: {error_log_path}")
+            sleep_until(time.time() + delay, "Retry wait", args.verbose)
+
+        if aborted:
+            break
         if result is None:
-            eprint(
-                f"Error: sample {sample} failed after {args.max_retries + 1} attempts; "
-                f"last error={last_error!r}; diagnostics={error_log_path}"
-            )
+            if allowance_blocked:
+                consecutive_allowance_skips += 1
+                if consecutive_allowance_skips >= MAX_CONSECUTIVE_ALLOWANCE_SKIPS:
+                    eprint(
+                        f"Stopping: {consecutive_allowance_skips} consecutive samples got no "
+                        f"allowance. The account is not releasing credits when expected, so the "
+                        f"remaining {len(plan) - sample} sample(s) would only repeat the wait. "
+                        f"Check 'run_esmfold2_api.py --test-availability --api-token ...' "
+                        f"and re-run with --refresh once credits are restored."
+                    )
+                    aborted = True
+                    break
+            else:
+                eprint(
+                    f"Error: sample {sample} failed after {submissions} submission(s); "
+                    f"last error={last_error!r}; diagnostics={error_log_path}"
+                )
             continue
+        consecutive_allowance_skips = 0
 
         try:
             cif_text = result.complex.to_mmcif()
@@ -837,6 +1533,10 @@ def main():
     if args.verbose:
         eprint(f"Completed {len(records)}/{len(plan)} predictions; summary: {summary_path}")
     print(str(summary_path.resolve()))
+    if aborted:
+        eprint(f"Aborted with {len(records)}/{len(plan)} predictions written. "
+               f"Re-run with --refresh once the allowance resets to complete the ensemble.")
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
