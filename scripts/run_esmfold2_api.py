@@ -42,18 +42,39 @@ from collections import OrderedDict
 from itertools import permutations
 from pathlib import Path
 
-try:
-    from esm.sdk import esmfold2_client
-    from esm.sdk.api import FoldingConfig, ESMProteinError
-    from esm.utils.structure import input_builder
-    from esm.utils.msa import MSA
-except ImportError:
-    print(
-        "Error: the current 'esm' SDK is required. Install it with: "
-        "pip install 'esm@git+https://github.com/Biohub/esm.git@main'",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+# The 'esm' SDK pulls in torch and takes seconds to import, so it is loaded on
+# demand instead of at module import time. That keeps --help, --test-availability,
+# --dry-run and the "summary already exists and --refresh was not given" early
+# exit instantaneous. Call require_esm() before touching any of these names.
+esmfold2_client = None
+FoldingConfig = None
+ESMProteinError = None
+input_builder = None
+MSA = None
+
+
+def require_esm():
+    """Import the esm SDK once and publish its names as module globals."""
+    global esmfold2_client, FoldingConfig, ESMProteinError, input_builder, MSA
+    if esmfold2_client is not None:
+        return
+    try:
+        from esm.sdk import esmfold2_client as _esmfold2_client
+        from esm.sdk.api import FoldingConfig as _FoldingConfig, ESMProteinError as _ESMProteinError
+        from esm.utils.structure import input_builder as _input_builder
+        from esm.utils.msa import MSA as _MSA
+    except ImportError:
+        print(
+            "Error: the current 'esm' SDK is required. Install it with: "
+            "pip install 'esm@git+https://github.com/Biohub/esm.git@main'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    esmfold2_client = _esmfold2_client
+    FoldingConfig = _FoldingConfig
+    ESMProteinError = _ESMProteinError
+    input_builder = _input_builder
+    MSA = _MSA
 
 MAX_CALLS_PER_MINUTE = 20
 MAX_CALLS_PER_24H = 100
@@ -363,6 +384,68 @@ def append_jsonl(path, payload):
         handle.write(json.dumps(payload, sort_keys=True, default=repr) + "\n")
 
 
+# --------------------------------------------------------------------------
+# Sampling presets
+#
+# The API returns one deterministic structure per (dropout, mask, MSA depth,
+# column mask, chain order) configuration. The number of DISTINCT structures an
+# ensemble can contain is therefore the size of that grid, and --n-poses beyond
+# it only re-requests configurations already covered.
+#
+# Holding the MSA at full depth leaves only dropout and column masking to vary,
+# which perturbs the prediction without moving it between conformational states.
+# Subsampling the MSA is the published route to real heterogeneity: del Alamo,
+# Sala, Mchaourab & Meiler, eLife 11:e75751 (2022) obtained alternative states
+# of transporters AND RECEPTORS by reducing MSA depth, and Wayment-Steele et al.
+# Nature 625:832 (2024) built on the same idea by clustering sequences.
+#
+# Caution for engineered constructs: Vo et al. (bioRxiv 2026, fiducial design)
+# deliberately avoided MSA subsampling for chimeras, reporting that "overly
+# limiting the MSA component risked producing unlikely if not completely
+# misfolded structures". The shallow rungs here stop at 16 rather than going to
+# single digits, and every pose should be screened for a corrupted fold before
+# it enters a rigidity measurement.
+# --------------------------------------------------------------------------
+SAMPLING_PRESETS = {
+    "legacy": {},
+    "conformational": {"msa_depths": "16,32,64,128,256,1024"},
+    "wide": {"msa_depths": "16,24,32,48,64,128,256,512,1024",
+             "lm_dropouts": "0.10,0.20,0.30"},
+}
+
+
+def apply_sampling_preset(args, explicit):
+    """Fill grid axes from the chosen preset unless the user set them explicitly."""
+    preset = SAMPLING_PRESETS[args.sampling_preset]
+    for key, value in preset.items():
+        if key not in explicit:
+            setattr(args, key, value)
+    return args
+
+
+def grid_summary(n_configs, requested):
+    """Human-readable account of what the ensemble will actually contain."""
+    lines = [f"Parameter grid: {n_configs} distinct configuration(s); "
+             f"{requested} API call(s) requested."]
+    if requested > n_configs:
+        duplicates = requested - n_configs
+        lines.append(
+            f"WARNING: within a single run the API is deterministic given a configuration, so this "
+            f"run can return at "
+            f"most {n_configs} distinct structures. {duplicates} of {requested} call(s) "
+            f"({100.0 * duplicates / requested:.0f}%) will recompute a configuration already "
+            f"covered. Widen the grid (--sampling-preset conformational) or use "
+            f"--one-call-per-config.")
+    elif requested < n_configs:
+        lines.append(
+            f"NOTE: only the first {requested} of {n_configs} configurations will be sampled; "
+            f"the grid is cycled in order, so the ensemble is a biased subset of it. "
+            f"Use --one-call-per-config to cover the grid exactly.")
+    else:
+        lines.append("Every call returns a distinct configuration; no budget is wasted.")
+    return lines
+
+
 def csv_values(text, cast, name, allow_none=False):
     values = []
     for raw in str(text).split(","):
@@ -443,6 +526,12 @@ def parse_args():
         description="Submit a high-quality, diverse ESMFold2 protein-complex ensemble to Biohub.",
     )
     p.add_argument("-i", "--inputfile", help="Multi-record protein FASTA. Required unless --test-availability is used.")
+    p.add_argument("--extra-sequences", default=None, metavar="NAME1:SEQ1::NAME2:SEQ2",
+                   help="Double-colon-separated named extra protein sequence(s) to append to the input FASTA records "
+                        "before the complex is built. Each item must be NAME:SEQUENCE. "
+                        "Example: --extra-sequences nano1:QVQLVES::nano2:EVQLVES. "
+                        "Output filenames still derive from the input FASTA stem, so use --tag to keep "
+                        "different extra-sequence combinations in separate summaries.")
     p.add_argument("--test-availability", action="store_true", help="Summarize how many calls for each API token can be made based on local timestamp records and exit.")
     p.add_argument("--tag", default="esmf", help="Output filename tag.")
     p.add_argument("--outdir", default=None, help="Output directory; defaults to the FASTA directory.")
@@ -463,7 +552,23 @@ def parse_args():
     p.add_argument("--lm-mask-pcts", default="0.0",
                    help="Comma-separated sequence-mask fractions; use 'none' for model default.")
     p.add_argument("--msa-depths", default="1024",
-                   help="Comma-separated MSA subsampling depths; use 'none' to disable subsampling.")
+                   help="Comma-separated MSA subsampling depths; use 'none' to disable subsampling. "
+                        "THIS IS THE MAIN DIVERSITY KNOB. The API is deterministic given a "
+                        "configuration, so the ensemble can never contain more distinct structures "
+                        "than there are grid configurations. A single depth (the default) therefore "
+                        "gives a narrow ensemble no matter how large --n-poses is. Subsampling the "
+                        "MSA hard is the published way to elicit genuine conformational "
+                        "heterogeneity (del Alamo et al., eLife 2022, validated on transporters and "
+                        "receptors). See --sampling-preset for ready-made ladders.")
+    p.add_argument("--sampling-preset", choices=tuple(SAMPLING_PRESETS), default="legacy",
+                   help="Ready-made parameter grids. 'legacy' reproduces the historical single-depth "
+                        "behaviour. 'conformational' and 'wide' add an MSA-depth ladder, which is what "
+                        "makes the ensemble span real conformational variation rather than a narrow "
+                        "band around one sampling regime. An explicit --msa-depths always wins.")
+    p.add_argument("--one-call-per-config", action="store_true",
+                   help="Set --n-poses to exactly the number of grid configurations, so every API "
+                        "call returns a distinct structure and none of the budget is spent "
+                        "recomputing duplicates.")
     p.add_argument("--msa-column-mask-rates", default="0.05,0.10,0.15",
                    help="Comma-separated non-query MSA column-mask fractions.")
     p.add_argument("--msa", action="append", default=[], metavar="CHAIN=FILE.a3m",
@@ -541,6 +646,14 @@ def parse_args():
     if not args.test_availability and not args.inputfile:
         p.error("-i/--inputfile is required unless --test-availability is used.")
 
+    # A preset only fills axes the user did not name on the command line, so an
+    # explicit --msa-depths always beats --sampling-preset.
+    explicit = {dest for dest, flags in (("msa_depths", ("--msa-depths",)),
+                                         ("lm_dropouts", ("--lm-dropouts",)),
+                                         ("lm_mask_pcts", ("--lm-mask-pcts",)))
+                if any(a == f or a.startswith(f + "=") for a in sys.argv[1:] for f in flags)}
+    apply_sampling_preset(args, explicit)
+
     if args.num_ensemble < 1:
         p.error("--num-ensemble must be >= 1")
     if args.spread < 0:
@@ -612,8 +725,50 @@ def read_fasta(path):
     return sequences
 
 
+def append_extra_sequences(sequences, spec_text):
+    """Append --extra-sequences NAME1:SEQ1::NAME2:SEQ2 records to a parsed FASTA.
+
+    Mirrors run_esmfold2.py: the named records become ordinary chains of the
+    complex, are validated the same way FASTA records are, and must not collide
+    with an identifier already present in the input file.
+    """
+    specs = [part.strip() for part in spec_text.split("::") if part.strip()]
+    if not specs:
+        raise ValueError("--extra-sequences was provided but no NAME:SEQUENCE pair(s) could be parsed.")
+
+    added = []
+    for spec in specs:
+        if ":" not in spec:
+            raise ValueError(
+                f"Invalid --extra-sequences entry {spec!r}. Expected NAME:SEQUENCE, with entries "
+                "separated by a double colon, e.g. NAME1:SEQ1::NAME2:SEQ2."
+            )
+        name, seq = spec.split(":", 1)
+        name = name.strip().split()[0] if name.strip() else ""
+        if not name:
+            raise ValueError(f"Invalid --extra-sequences entry {spec!r}: NAME is empty.")
+        seq = re.sub(r"\s+", "", seq).upper()
+        if not seq:
+            raise ValueError(f"Invalid --extra-sequences entry {spec!r}: SEQUENCE is empty.")
+        if not re.fullmatch(r"[A-Z*.-]+", seq):
+            raise ValueError(f"Invalid --extra-sequences entry {spec!r}: illegal sequence characters.")
+        seq = seq.replace("*", "")
+        if not seq:
+            raise ValueError(f"Invalid --extra-sequences entry {spec!r}: SEQUENCE is empty after cleanup.")
+        if name in sequences:
+            raise ValueError(
+                f"Duplicate sequence name {name!r} from --extra-sequences. Extra sequence names must be "
+                "unique and must not duplicate FASTA record names."
+            )
+        sequences[name] = seq
+        added.append(name)
+    return added
+
+
 def parse_msa_specs(specs, chain_ids, max_sequences):
     paths = {}
+    if specs:
+        require_esm()
     for spec in specs:
         if "=" not in spec:
             raise ValueError(f"Invalid --msa {spec!r}; expected CHAIN=FILE.a3m")
@@ -663,6 +818,11 @@ def build_run_plan(args, sequences):
                         })
     if not configs:
         raise ValueError("The ensemble parameter grid is empty")
+    # One call per configuration means every prediction is a distinct structure.
+    if getattr(args, "one_call_per_config", False):
+        args.num_ensemble = len(configs)
+    for line in grid_summary(len(configs), args.num_ensemble):
+        eprint(line)
     plan = []
     for index in range(args.num_ensemble):
         cfg = dict(configs[index % len(configs)])
@@ -1202,6 +1362,16 @@ def main():
         return
 
     sequences = read_fasta(input_path)
+    if args.extra_sequences:
+        try:
+            added_extra = append_extra_sequences(sequences, args.extra_sequences)
+        except ValueError as exc:
+            raise SystemExit(f"Error: {exc}")
+        if args.verbose:
+            eprint(f"Added {len(added_extra)} extra sequence(s) from --extra-sequences: "
+                   f"{', '.join(added_extra)}")
+    if not sequences:
+        raise SystemExit("Error: No sequences found in the input FASTA or --extra-sequences.")
     complex_id = stem
     if explain_api_length_limit(input_path, sequences, args):
         raise SystemExit(2)
@@ -1219,6 +1389,7 @@ def main():
         return
 
     api_keys = parse_api_keys(args.api_token)
+    require_esm()
     clients = {key: esmfold2_client(model=args.model, token=key) for key in api_keys}
     for api_client in clients.values():
         configure_client_retries(api_client, args.sdk_retry_attempts)
